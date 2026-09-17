@@ -6,10 +6,6 @@ Runs entirely on your own machine by default — LM Studio for local
 inference, or bring your own OpenAI-compatible cloud endpoint if you'd
 rather.
 
-For the deep implementation reference (file-by-file internals, known
-gotchas, exact bug histories) see [`ai.md`](./ai.md) — this file stays
-high-level.
-
 ---
 
 ## Features
