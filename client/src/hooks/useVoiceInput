@@ -1,0 +1,225 @@
+import { useRef, useState, useCallback, useEffect } from 'react';
+import { authHeaders } from '../utils/authToken';
+import { blobToWav16kMono } from '../utils/audioCapture';
+import { playWakeAcknowledgeChime } from '../utils/chime';
+
+const API_BASE = `http://${window.location.hostname}:3000/api`;
+const DEFAULT_COMMAND_MODEL = 'Xenova/whisper-base.en';
+const DEFAULT_POLL_MODEL = 'Xenova/whisper-tiny.en';
+
+// Handles both voice-input modes off one `settings.voiceInput` config:
+//   - push-to-talk: caller explicitly starts/stops one recording via the
+//     returned functions, gets one transcript back through onCommand()
+//   - wake-word: runs entirely on its own once enabled — continuously
+//     records rolling ~4s chunks using a CHEAP model (wakeWordPollModel,
+//     default tiny) so constant background listening isn't as expensive as
+//     running the full configured model nonstop. Only the one chunk right
+//     after the wake word is heard uses the more accurate whisperModel,
+//     since that's the part whose accuracy actually matters.
+//
+// `onCommand` should be a STABLE reference (wrap it in useCallback with a
+// ref-to-latest-logic if what it does depends on frequently-changing state)
+// — it's a dependency of the wake-word effect below, so a new identity every
+// render tears down and reopens the mic stream on every unrelated re-render.
+export default function useVoiceInput(settings, onCommand) {
+    const [isListening, setIsListening] = useState(false);
+    const [isTranscribing, setIsTranscribing] = useState(false);
+    const [awaitingCommand, setAwaitingCommand] = useState(false); // wake word heard, waiting on the actual command chunk
+    const mediaRecorderRef = useRef(null);
+    const streamRef = useRef(null);
+    const wakeWordActiveRef = useRef(false); // mirrors awaitingCommand but synchronous, for use inside the recording loop
+
+    const voiceConfig = settings?.voiceInput;
+
+    const transcribeBlob = useCallback(async (blob, modelOverride) => {
+        const wavBlob = await blobToWav16kMono(blob);
+        const formData = new FormData();
+        formData.append('audio', wavBlob, 'clip.wav');
+        if (modelOverride) formData.append('model', modelOverride);
+
+        const res = await fetch(`${API_BASE}/transcribe`, {
+            method: 'POST',
+            headers: authHeaders(),
+            body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Transcription failed');
+        return data.text || '';
+    }, []);
+
+    // ---- Push-to-talk ----
+    const startPushToTalk = useCallback(async () => {
+        if (mediaRecorderRef.current) return; // already recording
+
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+            console.error('Microphone access denied or unavailable:', err);
+            alert('⚠️ Could not access microphone. Check browser permissions.');
+            return;
+        }
+
+        streamRef.current = stream;
+        const recorder = new MediaRecorder(stream);
+        const chunks = [];
+        recorder.ondataavailable = (e) => chunks.push(e.data);
+        recorder.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
+            mediaRecorderRef.current = null;
+            setIsListening(false);
+
+            if (chunks.length === 0) return;
+            setIsTranscribing(true);
+            try {
+                // Push-to-talk always uses the main configured model (or its
+                // default) — no override needed, this isn't the polling path.
+                const text = await transcribeBlob(new Blob(chunks));
+                if (text) onCommand(text, 'push-to-talk');
+            } catch (err) {
+                console.error('Voice transcription failed:', err);
+                alert(`⚠️ Transcription failed: ${err.message}`);
+            } finally {
+                setIsTranscribing(false);
+            }
+        };
+        recorder.start();
+        mediaRecorderRef.current = recorder;
+        setIsListening(true);
+    }, [onCommand, transcribeBlob]);
+
+    const stopPushToTalk = useCallback(() => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+            mediaRecorderRef.current.stop();
+        }
+    }, []);
+
+    // ---- Wake word (continuous rolling chunks) ----
+    useEffect(() => {
+        if (!voiceConfig?.enabled || voiceConfig.mode !== 'wake-word') return;
+
+        let cancelled = false;
+        let stream = null;
+        let recorder = null;
+        wakeWordActiveRef.current = false;
+        setAwaitingCommand(false);
+
+        const CHUNK_MS = 4000;
+        const commandModel = voiceConfig.whisperModel || DEFAULT_COMMAND_MODEL;
+        const pollModel = voiceConfig.wakeWordPollModel || DEFAULT_POLL_MODEL;
+
+        function handleChunkTranscript(text) {
+            const wakeWord = (voiceConfig.wakeWord || '').toLowerCase().trim();
+            if (!wakeWord) return;
+            const lower = text.toLowerCase();
+
+            if (!wakeWordActiveRef.current) {
+                const idx = lower.indexOf(wakeWord);
+                if (idx === -1) return; // wake word not heard this chunk — keep polling cheaply
+
+                playWakeAcknowledgeChime();
+
+                const after = text.slice(idx + wakeWord.length).trim();
+                if (after) {
+                    // Wake word + command landed in the same chunk — already
+                    // transcribed with the poll (tiny) model in this case, so
+                    // accuracy is a little lower, but it's the fast path.
+                    onCommand(after, 'wake-word');
+                } else {
+                    // Wake word alone this chunk — the NEXT chunk is the
+                    // command, and will use the more accurate model.
+                    wakeWordActiveRef.current = true;
+                    setAwaitingCommand(true);
+                }
+            } else {
+                wakeWordActiveRef.current = false;
+                setAwaitingCommand(false);
+                if (text.trim()) onCommand(text.trim(), 'wake-word');
+            }
+        }
+
+        function recordOneChunk() {
+            if (cancelled || !stream) return;
+
+            // Decided BEFORE this chunk records: if the previous chunk just
+            // heard the wake word, this chunk is the actual command, so use
+            // the accurate model; otherwise it's routine polling, use the
+            // cheap one.
+            const modelForThisChunk = wakeWordActiveRef.current ? commandModel : pollModel;
+
+            const chunks = [];
+            recorder = new MediaRecorder(stream);
+            recorder.ondataavailable = (e) => chunks.push(e.data);
+            recorder.onstop = () => {
+                if (cancelled) return;
+
+                // Start the NEXT chunk recording immediately — before this
+                // chunk's transcription even begins — so there's no dead air
+                // while waiting on the network/inference round trip. Previously
+                // this awaited transcribeBlob() first, which left a real gap
+                // (often 1+ second) where the mic simply wasn't recording;
+                // anything you said in that gap was lost, and Whisper's classic
+                // hallucination on near-silent leftover audio is a stray "."
+                // or "you" — which is exactly what was showing up in chat.
+                recordOneChunk();
+
+                if (chunks.length > 0) {
+                    transcribeBlob(new Blob(chunks), modelForThisChunk)
+                        .then((text) => {
+                            if (!cancelled && text) handleChunkTranscript(text);
+                        })
+                        .catch((err) => console.error('Wake-word transcription failed:', err));
+                }
+            };
+            recorder.start();
+            setTimeout(() => {
+                if (recorder?.state === 'recording') recorder.stop();
+            }, CHUNK_MS);
+        }
+
+        async function start() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                console.error('Microphone access denied or unavailable:', err);
+                return;
+            }
+            if (cancelled) {
+                stream.getTracks().forEach(t => t.stop());
+                return;
+            }
+            streamRef.current = stream;
+            setIsListening(true);
+            recordOneChunk();
+        }
+
+        start();
+
+        return () => {
+            cancelled = true;
+            if (recorder?.state === 'recording') recorder.stop();
+            stream?.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
+            setIsListening(false);
+            setAwaitingCommand(false);
+        };
+    }, [
+        voiceConfig?.enabled,
+        voiceConfig?.mode,
+        voiceConfig?.wakeWord,
+        voiceConfig?.whisperModel,
+        voiceConfig?.wakeWordPollModel,
+        onCommand,
+        transcribeBlob,
+    ]);
+
+    return {
+        isListening,
+        isTranscribing,
+        awaitingCommand,
+        startPushToTalk,
+        stopPushToTalk,
+        pushToTalkAvailable: Boolean(voiceConfig?.enabled && voiceConfig.mode === 'push-to-talk'),
+    };
+}

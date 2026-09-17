@@ -1,0 +1,28 @@
+/* Theme variables — a future theme-maker changes these at runtime via
+   document.documentElement.style.setProperty('--var-name', value) and
+   every component referencing them updates instantly, no rebuild needed. */
+:root {
+    --bg-app: #1a1a1a;
+    --bg-panel: rgba(20, 20, 20, 0.85);
+    --bg-input: #2a2a2a;
+    --bg-chip: #2a2a2a;
+    --bg-chip-pending: #333;
+    --bg-code: rgba(255, 255, 255, 0.08);
+
+    --border-color: #444;
+    --border-strong: #555;
+    --border-subtle: rgba(255, 255, 255, 0.1);
+
+    --text-primary: #ddd;
+    --text-bright: #eee;
+    --text-dim: #aaa;
+    --text-faint: #888;
+    --text-faintest: #666;
+    --text-heading-3: #ddd;
+
+    --accent-color: #4CAF50;
+    --error-color: #f88;
+    --link-color: #7ab8ff;
+    --danger-color: #c77;
+    --danger-border: #663333;
+}
