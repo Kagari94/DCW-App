@@ -8,9 +8,9 @@ const defaults = require('./config.js');
 const SETTINGS_PATH = path.join(__dirname, 'data', 'settings.json');
 
 // Computes the actual fields toolCallLoop.js / the /models route read
-// (AI_API_URL, MODEL_NAME, API_KEY) from whichever provider is active.
-// This is the ONLY place that needs to know multiple providers exist —
-// everything downstream keeps reading three plain fields like before.
+// (AI_API_URL, MODEL_NAME, API_KEY, CA_CERT_PATH) from whichever provider
+// is active. This is the ONLY place that needs to know multiple providers
+// exist — everything downstream keeps reading four plain fields like before.
 function deriveModelConfig(llm) {
     const providerId = llm?.provider || 'lmstudio';
     const cfg = llm?.providers?.[providerId] || {};
@@ -20,6 +20,7 @@ function deriveModelConfig(llm) {
             AI_API_URL: 'https://api.openai.com/v1/chat/completions',
             MODEL_NAME: cfg.model || 'gpt-4o-mini',
             API_KEY: cfg.apiKey || '',
+            CA_CERT_PATH: '', // public HTTPS endpoint — normal system trust store
         };
     }
     if (providerId === 'custom') {
@@ -27,6 +28,12 @@ function deriveModelConfig(llm) {
             AI_API_URL: cfg.baseUrl || '',
             MODEL_NAME: cfg.model || '',
             API_KEY: cfg.apiKey || '',
+            // Optional: path to a CA cert to pin for this endpoint (e.g.
+            // Caddy's local CA root, for a LAN server behind self-signed
+            // TLS). Left empty, this endpoint just uses the system trust
+            // store like any other HTTPS call — set it when the custom
+            // endpoint is on a LAN proxy with a self-signed cert.
+            CA_CERT_PATH: cfg.caCertPath || '',
         };
     }
     // lmstudio (default) — no API key needed for a local server
@@ -34,6 +41,7 @@ function deriveModelConfig(llm) {
         AI_API_URL: cfg.baseUrl || defaults.AI_API_URL,
         MODEL_NAME: cfg.model || defaults.MODEL_NAME,
         API_KEY: '',
+        CA_CERT_PATH: '',
     };
 }
 
@@ -44,7 +52,7 @@ function baseSeed() {
             providers: {
                 lmstudio: { baseUrl: defaults.AI_API_URL, model: defaults.MODEL_NAME },
                 openai: { apiKey: '', model: 'gpt-4o-mini' },
-                custom: { baseUrl: '', apiKey: '', model: '' },
+                custom: { baseUrl: '', apiKey: '', model: '', caCertPath: '' },
             },
         },
         // Derived from llm above — see deriveModelConfig. Kept as plain top-
@@ -53,6 +61,20 @@ function baseSeed() {
         MODEL_NAME: defaults.MODEL_NAME,
         AI_API_URL: defaults.AI_API_URL,
         API_KEY: defaults.API_KEY || '',
+        CA_CERT_PATH: '',
+
+        // A single, always-on-if-enabled endpoint — NOT part of the
+        // llm.providers switcher above, since this is a dedicated small
+        // vision model running alongside (not instead of) the main chat
+        // provider, not something the user picks between. See
+        // routes/vision.js / lib/visionGatekeeper.js.
+        cameraGatekeeper: {
+            enabled: false,
+            baseUrl: '',
+            model: '',
+            apiKey: '',
+            caCertPath: '',
+        },
 
         currentCharacter: null,
         backgroundColor: '#1a1a1a',
@@ -125,6 +147,14 @@ function updateSettings(partial) {
             merged.llm.providers = mergedProviders;
         }
         merged = { ...merged, ...deriveModelConfig(merged.llm) };
+    }
+
+    // Same reasoning as `llm` above — cameraGatekeeper is a nested object,
+    // and the header icon toggle sends only { enabled } while the Settings
+    // panel's fields send other keys separately; a shallow top-level
+    // spread would let either one silently wipe out the other's fields.
+    if (partial.cameraGatekeeper) {
+        merged.cameraGatekeeper = { ...(current.cameraGatekeeper || {}), ...partial.cameraGatekeeper };
     }
 
     fs.writeFileSync(SETTINGS_PATH, JSON.stringify(merged, null, 2));

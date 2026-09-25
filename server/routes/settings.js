@@ -9,6 +9,7 @@ const multer = require('multer');
 const { getSettings, updateSettings } = require('../settings.js');
 const { syncPrompt } = require('../scripts/syncExpressions.js');
 const CONFIG = require('../config.js');
+const { getHttpsAgent } = require('../lib/httpAgents.js');
 
 const router = express.Router();
 
@@ -64,6 +65,10 @@ router.get('/models', async (req, res) => {
     const savedProviderCfg = CONFIG.llm?.providers?.[provider] || {};
     const baseUrlRaw = req.query.baseUrl || savedProviderCfg.baseUrl || (provider === 'lmstudio' ? CONFIG.AI_API_URL : '');
     const apiKey = req.query.apiKey ?? savedProviderCfg.apiKey ?? '';
+    // Not exposed as a query override (unlike baseUrl/apiKey above) — the CA
+    // cert is a machine-local trust setting, not something that makes sense
+    // to preview ad hoc from the UI. Always comes from the saved setting.
+    const caCertPath = savedProviderCfg.caCertPath || '';
 
     if (!baseUrlRaw) {
         return res.status(400).json({ error: 'No base URL configured for this provider yet.', models: [] });
@@ -74,6 +79,8 @@ router.get('/models', async (req, res) => {
         const response = await axios.get(`${baseUrl}/models`, {
             headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
             timeout: 5000, // fail fast instead of hanging when the server is unreachable/closed
+            httpsAgent: getHttpsAgent(caCertPath),
+            proxy: false,
         });
         const models = response.data.data?.map(m => m.id) ?? [];
         res.json({ models, source: 'live' });

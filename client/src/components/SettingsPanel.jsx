@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { authHeaders } from '../utils/authToken';
-
-const API_BASE = `http://${window.location.hostname}:3000/api`;
+import { apiFetch, VOICES_BASE } from '../apiConfig';
 
 const WHISPER_MODELS = [
     { value: 'Xenova/whisper-tiny.en', label: 'Tiny (fastest, English only)' },
@@ -51,10 +50,10 @@ function SettingsPanel({ onSettingsChange }) {
 
     async function loadAll() {
         const [settingsRes, charactersRes, voicesRes, pocketVoicesRes] = await Promise.all([
-            fetch(`${API_BASE}/settings`, { headers: authHeaders() }).then(r => r.json()),
-            fetch(`${API_BASE}/characters`, { headers: authHeaders() }).then(r => r.json()),
-            fetch(`${API_BASE}/voices`, { headers: authHeaders() }).then(r => r.json()),
-            fetch(`${API_BASE}/pocket-voices`, { headers: authHeaders() }).then(r => r.json()),
+            apiFetch('/api/settings', { headers: authHeaders() }).then(r => r.json()),
+            apiFetch('/api/characters', { headers: authHeaders() }).then(r => r.json()),
+            apiFetch('/api/voices', { headers: authHeaders() }).then(r => r.json()),
+            apiFetch('/api/pocket-voices', { headers: authHeaders() }).then(r => r.json()),
         ]);
         setSettings(settingsRes);
         setCharacters(charactersRes.characters || []);
@@ -63,12 +62,12 @@ function SettingsPanel({ onSettingsChange }) {
     }
 
     async function refreshPocketVoices() {
-        const data = await fetch(`${API_BASE}/pocket-voices`, { headers: authHeaders() }).then(r => r.json());
+        const data = await apiFetch('/api/pocket-voices', { headers: authHeaders() }).then(r => r.json());
         setPocketVoiceFiles(data.voices || []);
     }
 
     async function saveSetting(partial) {
-        const res = await fetch(`${API_BASE}/settings`, {
+        const res = await apiFetch('/api/settings', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
             body: JSON.stringify(partial),
@@ -100,7 +99,7 @@ function SettingsPanel({ onSettingsChange }) {
         formData.append('vrm', file);
 
         try {
-            const res = await fetch(`${API_BASE}/characters/upload`, {
+            const res = await apiFetch('/api/characters/upload', {
                 method: 'POST',
                 headers: { ...authHeaders() },
                 body: formData,
@@ -134,7 +133,7 @@ function SettingsPanel({ onSettingsChange }) {
         formData.append('voice', file);
 
         try {
-            const res = await fetch(`${API_BASE}/pocket-voices/upload`, {
+            const res = await apiFetch('/api/pocket-voices/upload', {
                 method: 'POST',
                 headers: { ...authHeaders() },
                 body: formData,
@@ -144,7 +143,7 @@ function SettingsPanel({ onSettingsChange }) {
 
             await refreshPocketVoices();
 
-            const url = `http://${window.location.hostname}:3000/voices/${data.filename}`;
+            const url = `${VOICES_BASE}/${data.filename}`;
             await saveSetting({ pocketTts: { ...(settings.pocketTts ?? {}), voice: url } });
         } catch (err) {
             alert(`Upload failed: ${err.message}`);
@@ -168,7 +167,7 @@ function SettingsPanel({ onSettingsChange }) {
         if (cfg.baseUrl) params.set('baseUrl', cfg.baseUrl);
         if (cfg.apiKey) params.set('apiKey', cfg.apiKey);
 
-        fetch(`${API_BASE}/models?${params}`, { headers: authHeaders() })
+        apiFetch(`/api/models?${params}`, { headers: authHeaders() })
             .then(r => r.json())
             .then(data => {
                 setLlmModelOptions(data.models || []);
@@ -279,6 +278,25 @@ function SettingsPanel({ onSettingsChange }) {
                             </>
                         )}
 
+                        {llmDraftProvider === 'custom' && (
+                            <>
+                                <label className="settings-label settings-label-spaced">CA Cert Path (optional)</label>
+                                <input
+                                    type="text"
+                                    value={draftCfg.caCertPath || ''}
+                                    onChange={(e) => updateDraftField(llmDraftProvider, 'caCertPath', e.target.value)}
+                                    placeholder="e.g. server/certs/lan-llm-ca.crt"
+                                    className="settings-select"
+                                />
+                                <div className="settings-note">
+                                    Only needed if this endpoint is behind a self-signed TLS proxy (e.g. a
+                                    LAN reverse proxy) — pins trust to that one CA cert instead of relying
+                                    on the system trust store. Leave blank for a normal public HTTPS
+                                    endpoint or a plain local server.
+                                </div>
+                            </>
+                        )}
+
                         <div className="settings-model-row">
                             <label className="settings-label settings-label-spaced">Model</label>
                             <button type="button" onClick={refreshModels} className="settings-refresh-btn" title="Refresh model list">
@@ -359,7 +377,7 @@ function SettingsPanel({ onSettingsChange }) {
                         value={currentVoiceKnown ? currentVoiceFilename : ''}
                         onChange={(e) => {
                             if (!e.target.value) return;
-                            const url = `http://${window.location.hostname}:3000/voices/${e.target.value}`;
+                            const url = `${VOICES_BASE}/${e.target.value}`;
                             saveSetting({ pocketTts: { ...(settings.pocketTts ?? {}), voice: url } });
                         }}
                         className="settings-select"
@@ -473,6 +491,55 @@ function SettingsPanel({ onSettingsChange }) {
             </div>
 
             <div>
+                <label className="settings-label">Camera Gatekeeper (Live Analysis)</label>
+                <div className="settings-note">
+                    Connection for the background live-camera monitor — a small, separate vision
+                    model (not your main chat model) that watches for anything worth escalating.
+                    Toggle it on/off from the 📷 button in the chat header; configure where it
+                    runs here.
+                </div>
+                <label className="settings-label settings-label-spaced">Base URL</label>
+                <input
+                    type="text"
+                    value={settings.cameraGatekeeper?.baseUrl || ''}
+                    onChange={(e) => saveSetting({
+                        cameraGatekeeper: { ...(settings.cameraGatekeeper ?? {}), baseUrl: e.target.value },
+                    })}
+                    placeholder="e.g. https://192.168.1.145:8444/v1/chat/completions"
+                    className="settings-select"
+                />
+                <label className="settings-label settings-label-spaced">Model</label>
+                <input
+                    type="text"
+                    value={settings.cameraGatekeeper?.model || ''}
+                    onChange={(e) => saveSetting({
+                        cameraGatekeeper: { ...(settings.cameraGatekeeper ?? {}), model: e.target.value },
+                    })}
+                    placeholder="e.g. lfm2.5-vl-3b"
+                    className="settings-select"
+                />
+                <label className="settings-label settings-label-spaced">API Key</label>
+                <input
+                    type="password"
+                    value={settings.cameraGatekeeper?.apiKey || ''}
+                    onChange={(e) => saveSetting({
+                        cameraGatekeeper: { ...(settings.cameraGatekeeper ?? {}), apiKey: e.target.value },
+                    })}
+                    className="settings-select"
+                />
+                <label className="settings-label settings-label-spaced">CA Cert Path (optional)</label>
+                <input
+                    type="text"
+                    value={settings.cameraGatekeeper?.caCertPath || ''}
+                    onChange={(e) => saveSetting({
+                        cameraGatekeeper: { ...(settings.cameraGatekeeper ?? {}), caCertPath: e.target.value },
+                    })}
+                    placeholder="e.g. certs/lan-llm-ca.crt"
+                    className="settings-select"
+                />
+            </div>
+
+            <div>
                 <label className="settings-label">Web Search Provider</label>
                 <select
                     value={settings.webSearch?.provider || 'searxng'}
@@ -583,7 +650,7 @@ function SettingsPanel({ onSettingsChange }) {
                     );
                 })}
                 <button onClick={async () => {
-                    const res = await fetch(`${API_BASE}/tools/open-config`, {
+                    const res = await apiFetch('/api/tools/open-config', {
                         method: 'POST',
                         headers: authHeaders(),
                     });

@@ -1,11 +1,10 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { authHeaders } from '../utils/authToken';
+import { apiFetch } from '../apiConfig';
 import { cleanTextForDisplay, getSafeDisplayPrefix } from '../utils/textParsing';
 import useVoiceInput from '../hooks/useVoiceInput';
-
-const API_BASE = `http://${window.location.hostname}:3000/api`;
 
 const markdownComponents = {
     h1: (props) => <h4 className="md-heading md-heading-1" {...props} />,
@@ -21,7 +20,6 @@ const markdownComponents = {
 };
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-const SCREEN_KEYWORDS = /\b(screen|screenshot|screen\s*share|screen\s*sharing|what('?s| is) on my screen|what do you see|look at my screen|see my screen)\b/i;
 
 function getExtension(filename) {
     const dot = filename.lastIndexOf('.');
@@ -31,8 +29,8 @@ function getExtension(filename) {
 function GeneratedFileChip({ conversationId, file }) {
     async function handleDownload() {
         try {
-            const res = await fetch(
-                `${API_BASE}/conversations/${conversationId}/documents/${file.storedFilename}`,
+            const res = await apiFetch(
+                `/api/conversations/${conversationId}/documents/${file.storedFilename}`,
                 { headers: authHeaders() },
             );
             if (!res.ok) throw new Error('Download failed');
@@ -68,7 +66,7 @@ function AttachmentPreview({ conversationId, attachment }) {
         let objectUrl;
         let cancelled = false;
 
-        fetch(`${API_BASE}/conversations/${conversationId}/attachments/${attachment.storedFilename}`, {
+        apiFetch(`/api/conversations/${conversationId}/attachments/${attachment.storedFilename}`, {
             headers: authHeaders(),
         })
             .then(res => res.blob())
@@ -94,9 +92,51 @@ function AttachmentPreview({ conversationId, attachment }) {
     return <div className="attachment-chip">📄 {attachment.filename}</div>;
 }
 
-function ChatBox({
+// Reads one NDJSON response stream and dispatches each event as it arrives.
+// Returns/stops as soon as the stream reaches a terminal event ('done',
+// 'need_screen_frame', or 'error') — 'need_screen_frame' isn't actually
+// terminal for the overall exchange, just for THIS stream: the caller's
+// onNeedScreenFrame is expected to capture a frame, hit /chat/continue,
+// and call this function again on the new response to keep going. That
+// recursion lives in sendMessage, not here — this function only knows how
+// to drain one stream.
+async function consumeNdjsonStream(res, { onDelta, onDone, onNeedScreenFrame }) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            const event = JSON.parse(line);
+
+            if (event.type === 'delta') {
+                onDelta(event.content);
+            } else if (event.type === 'done') {
+                onDone(event);
+                return;
+            } else if (event.type === 'need_screen_frame') {
+                await onNeedScreenFrame(event);
+                return;
+            } else if (event.type === 'error') {
+                throw new Error(event.error);
+            }
+        }
+    }
+
+    throw new Error('Stream ended without a final response.');
+}
+
+const ChatBox = forwardRef(function ChatBox({
     conversationId, settings, onReplyChunk, onUiEvents, onConversationUpdated,
-    screenSessionActive, onGrabScreenFrame, onStopScreenSession }) {
+    screenSessionActive, onGrabScreenFrame, onStopScreenSession, onUserActivity }, ref) {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
@@ -140,7 +180,7 @@ function ChatBox({
     }, [messages]);
 
     async function loadConversation() {
-        const res = await fetch(`${API_BASE}/conversations/${conversationId}`, { headers: authHeaders() });
+        const res = await apiFetch(`/api/conversations/${conversationId}`, { headers: authHeaders() });
         if (!res.ok) return;
         const data = await res.json();
         const displayMessages = data.messages
@@ -154,25 +194,28 @@ function ChatBox({
         setMessages(displayMessages);
     }
 
-    async function handleFileSelect(e) {
-        const files = Array.from(e.target.files || []);
-        e.target.value = '';
+    async function uploadAttachment(file) {
+        if (!file || !conversationId) return null;
 
-        if (files.length === 0 || !conversationId) return;
+        const formData = new FormData();
+        formData.append('file', file);
 
-        setUploading(true);
-
-        try {
-            for (const file of files) {
-                const data = await uploadAttachment(file);
-                setPendingAttachments(prev => [...prev, data]);
+        const res = await apiFetch(
+            `/api/conversations/${conversationId}/attachments`,
+            {
+                method: 'POST',
+                headers: authHeaders(),
+                body: formData,
             }
-        } catch (err) {
-            console.error('Attachment upload error:', err);
-            alert(`⚠️ Attachment upload failed: ${err.message}`);
-        } finally {
-            setUploading(false);
+        );
+
+        const data = await res.json();
+
+        if (!res.ok) {
+            throw new Error(data.error || 'Upload failed');
         }
+
+        return data;
     }
 
     async function handleFileSelect(e) {
@@ -183,18 +226,7 @@ function ChatBox({
         setUploading(true);
         try {
             for (const file of files) {
-                const formData = new FormData();
-                formData.append('file', file);
-
-                const res = await fetch(`${API_BASE}/conversations/${conversationId}/attachments`, {
-                    method: 'POST',
-                    headers: authHeaders(),
-                    body: formData,
-                });
-
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.error || 'Upload failed');
-
+                const data = await uploadAttachment(file);
                 setPendingAttachments(prev => [...prev, data]);
             }
         } catch (err) {
@@ -225,32 +257,26 @@ function ChatBox({
         });
     }
 
-    async function sendMessage(overrideText) {
+    // `silent`: used by the Anki heartbeat's proactive nudge (see App.jsx's
+    // triggerSystemNudge via the imperative handle below) — the prompt
+    // still gets sent to the backend as a real user-role turn (the model
+    // needs something to respond to), it's just not rendered as a "You:"
+    // bubble live. NOTE: if this conversation is reopened later,
+    // loadConversation has no way to know that turn was synthetic, so it
+    // WILL show up as a "You:" line on reload — a known, accepted gap
+    // rather than something silently hidden forever.
+    async function sendMessage(overrideText, { silent = false } = {}) {
         const trimmed = (typeof overrideText === 'string' ? overrideText : input).trim();
 
         if ((!trimmed && pendingAttachments.length === 0) || loading || !conversationId) return;
 
-        let attachmentsToSend = [...pendingAttachments];
+        if (!silent && onUserActivity) onUserActivity();
 
-        if (screenSessionActive && onGrabScreenFrame && SCREEN_KEYWORDS.test(trimmed)) {
-            try {
-                const frameFile = await onGrabScreenFrame();
-
-                if (frameFile) {
-                    const uploadedFrame = await uploadAttachment(frameFile);
-
-                    if (uploadedFrame) {
-                        attachmentsToSend.push(uploadedFrame);
-                    }
-                }
-            } catch (err) {
-                console.error('Auto screen-attach failed:', err);
-            }
-        }
+        const attachmentsToSend = [...pendingAttachments];
 
         setMessages(prev => [
             ...prev,
-            { sender: 'You', text: trimmed, attachments: attachmentsToSend },
+            ...(silent ? [] : [{ sender: 'You', text: trimmed, attachments: attachmentsToSend }]),
             { sender: 'AI', text: '' },
         ]);
 
@@ -259,15 +285,63 @@ function ChatBox({
         setLoading(true);
 
         let rawBuffer = '';
+        let finalPayload = null;
+
+        function onDelta(content) {
+            rawBuffer += content;
+            updateLastAiMessage(cleanTextForDisplay(getSafeDisplayPrefix(rawBuffer)));
+            if (onReplyChunk) onReplyChunk(rawBuffer, { done: false });
+        }
+
+        function onDone(event) {
+            finalPayload = event;
+        }
+
+        // The model decided (via the view_screen tool, from context — no
+        // keyword matching anymore) that it needs to see the screen.
+        // Capture a frame from the already-open session stream, upload it
+        // through the normal attachments endpoint, then hit /chat/continue
+        // to resume the SAME reply with that frame injected. Loops back
+        // into consumeNdjsonStream, so a second/third view_screen call in
+        // the same reply (unlikely, but possible) just repeats this.
+        async function onNeedScreenFrame(event) {
+            if (!onGrabScreenFrame) {
+                throw new Error('Screen capture requested but not available.');
+            }
+            const frameFile = await onGrabScreenFrame();
+            if (!frameFile) {
+                throw new Error('Could not capture a screen frame — is sharing still active?');
+            }
+            const uploadedFrame = await uploadAttachment(frameFile);
+
+            const continueRes = await apiFetch('/api/chat/continue', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify({
+                    conversationId,
+                    toolCallId: event.toolCallId,
+                    attachment: uploadedFrame,
+                    screenSessionActive,
+                }),
+            });
+
+            if (!continueRes.ok || !continueRes.body) {
+                const data = await continueRes.json().catch(() => ({}));
+                throw new Error(data.error || `Continue request failed (${continueRes.status})`);
+            }
+
+            await consumeNdjsonStream(continueRes, { onDelta, onDone, onNeedScreenFrame });
+        }
 
         try {
-            const res = await fetch(`${API_BASE}/chat`, {
+            const res = await apiFetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
                 body: JSON.stringify({
                     message: trimmed,
                     conversationId,
                     attachments: attachmentsToSend.length > 0 ? attachmentsToSend : undefined,
+                    screenSessionActive,
                 }),
             });
 
@@ -276,34 +350,7 @@ function ChatBox({
                 throw new Error(data.error || `Request failed (${res.status})`);
             }
 
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let ndjsonBuffer = '';
-            let finalPayload = null;
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                ndjsonBuffer += decoder.decode(value, { stream: true });
-                const lines = ndjsonBuffer.split('\n');
-                ndjsonBuffer = lines.pop();
-
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    const event = JSON.parse(line);
-
-                    if (event.type === 'delta') {
-                        rawBuffer += event.content;
-                        updateLastAiMessage(cleanTextForDisplay(getSafeDisplayPrefix(rawBuffer)));
-                        if (onReplyChunk) onReplyChunk(rawBuffer, { done: false });
-                    } else if (event.type === 'done') {
-                        finalPayload = event;
-                    } else if (event.type === 'error') {
-                        throw new Error(event.error);
-                    }
-                }
-            }
+            await consumeNdjsonStream(res, { onDelta, onDone, onNeedScreenFrame });
 
             if (!finalPayload) throw new Error('Stream ended without a final response.');
 
@@ -321,6 +368,14 @@ function ChatBox({
             setLoading(false);
         }
     }
+
+    useImperativeHandle(ref, () => ({
+        // Sends a hidden system-style prompt for the AI to react to,
+        // without a "You:" bubble appearing live. See the Anki heartbeat
+        // note above sendMessage for the one known caveat (reappears on
+        // reload).
+        triggerSystemNudge: (text) => sendMessage(text, { silent: true }),
+    }));
 
     function handleKeyPress(e) {
         if (e.key === 'Enter') sendMessage();
@@ -442,6 +497,6 @@ function ChatBox({
             </div>
         </div>
     );
-}
+});
 
 export default ChatBox;

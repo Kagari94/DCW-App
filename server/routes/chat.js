@@ -54,9 +54,84 @@ router.delete('/conversations/:id', (req, res) => {
     res.json({ deleted: true });
 });
 
+// Shared by /chat and /chat/continue — runs the tool-calling loop against
+// whatever's currently on conversation.messages and either finalizes
+// normally (a real reply came back) or pauses for a screen frame
+// (runWithTools returned needsScreenFrame instead of a message). Both
+// routes have already pushed whatever turn belongs at the front
+// (a user message, or a tool-ack + captured-frame turn) before calling
+// this — this function only knows how to run the loop and react to what
+// comes out the other end.
+async function runTurnAndRespond({ conversation, toolConfig, sendEvent, CONFIG, messageCountBeforeThisTurn, userTextForMemoryJobs }) {
+    const { message: finalMessage, uiEvents, needsScreenFrame } = await runWithTools(
+        conversation.messages,
+        toolConfig,
+        (delta) => sendEvent({ type: 'delta', content: delta }),
+    );
+
+    if (needsScreenFrame) {
+        // Nothing final happened — just persist the pending tool_calls
+        // message that's now on conversation.messages, and tell the
+        // client to go capture a frame and continue. No 'done' event,
+        // no background memory jobs — those only make sense once there's
+        // an actual reply.
+        saveConversation(conversation);
+        sendEvent({ type: 'need_screen_frame', toolCallId: needsScreenFrame.toolCallId, conversationId: conversation.id });
+        return;
+    }
+
+    // Everything runWithTools appended this turn — tool calls, tool results,
+    // and any injected image-view/screen-frame turns — now lives directly on
+    // conversation.messages, since the loop mutates it in place. Scan just the
+    // new slice for any generated-document markers, same as before.
+    const toolTurns = conversation.messages.slice(messageCountBeforeThisTurn + 1);
+    const generatedFiles = [];
+    for (const turn of toolTurns) {
+        if (turn.role !== 'tool') continue;
+        try {
+            const parsed = JSON.parse(turn.content);
+            if (parsed?.generatedFile) generatedFiles.push(parsed.generatedFile);
+        } catch { /* not JSON or no generatedFile — ignore */ }
+    }
+
+    const reply = finalMessage.content;
+    if (!reply) throw new Error('No content in AI response.');
+
+    conversation.messages.push({
+        role: 'assistant',
+        content: reply,
+        ...(generatedFiles.length ? { generatedFiles } : {}),
+    });
+    maybeSetTitle(conversation);
+    saveConversation(conversation);
+
+    // Fire-and-forget background memory jobs — fact extraction + rolling
+    // summarization. Only fires when there's real new user text to extract
+    // from (the initial /chat call); a /chat/continue resume has no new
+    // user-authored text of its own (just a captured frame), so it's
+    // skipped there rather than extracting facts from an attachment note.
+    if (userTextForMemoryJobs) {
+        runBackgroundMemoryJobs({
+            conversation,
+            userText: userTextForMemoryJobs,
+            assistantText: reply,
+            config: CONFIG,
+        });
+    }
+
+    sendEvent({
+        type: 'done',
+        reply,
+        conversationId: conversation.id,
+        title: conversation.title,
+        uiEvents,
+        generatedFiles,
+    });
+}
+
 router.post('/chat', async (req, res) => {
     const CONFIG = getSettings();
-    const { message, conversationId, attachments } = req.body;
+    const { message, conversationId, attachments, screenSessionActive } = req.body;
 
     if (!message || typeof message !== 'string') {
         return res.status(400).json({ error: 'Message is required.' });
@@ -117,56 +192,20 @@ router.post('/chat', async (req, res) => {
         // through toolConfig so toolCallLoop.js can inject it fresh on every
         // model call without recomputing it per tool-loop iteration.
         const memoryContext = await buildMemoryContext(message, conversationId);
-        const toolConfig = { ...CONFIG, conversationId, memoryContext };
+        // screenSessionActive comes from the client on every request — it's
+        // per-session UI state (is getDisplayMedia currently authorized in
+        // THIS browser tab), not something the server can know or persist
+        // on its own. tools/handlers/screen.js reads this to decide whether
+        // view_screen can actually be fulfilled.
+        const toolConfig = { ...CONFIG, conversationId, memoryContext, screenSessionActive: Boolean(screenSessionActive) };
 
-        const { message: finalMessage, uiEvents } = await runWithTools(
-            conversation.messages,
-            toolConfig,
-            (delta) => sendEvent({ type: 'delta', content: delta }),
-        );
-
-        // Everything runWithTools appended this turn — tool calls, tool results,
-        // and any injected image-view turns — now lives directly on
-        // conversation.messages, since the loop mutates it in place. Scan just the
-        // new slice for any generated-document markers, same as before.
-        const toolTurns = conversation.messages.slice(messageCountBeforeThisTurn + 1);
-        const generatedFiles = [];
-        for (const turn of toolTurns) {
-            if (turn.role !== 'tool') continue;
-            try {
-                const parsed = JSON.parse(turn.content);
-                if (parsed?.generatedFile) generatedFiles.push(parsed.generatedFile);
-            } catch { /* not JSON or no generatedFile — ignore */ }
-        }
-
-        const reply = finalMessage.content;
-        if (!reply) throw new Error('No content in AI response.');
-
-        conversation.messages.push({
-            role: 'assistant',
-            content: reply,
-            ...(generatedFiles.length ? { generatedFiles } : {}),
-        });
-        maybeSetTitle(conversation);
-        saveConversation(conversation);
-
-        // Fire-and-forget background memory jobs — fact extraction + rolling
-        // summarization. Kicked off AFTER the reply is sent, never awaited,
-        // each swallows its own errors internally (see memory/index.js).
-        runBackgroundMemoryJobs({
+        await runTurnAndRespond({
             conversation,
-            userText: message,
-            assistantText: reply,
-            config: CONFIG,
-        });
-
-        sendEvent({
-            type: 'done',
-            reply,
-            conversationId: conversation.id,
-            title: conversation.title,
-            uiEvents,
-            generatedFiles,
+            toolConfig,
+            sendEvent,
+            CONFIG,
+            messageCountBeforeThisTurn,
+            userTextForMemoryJobs: message,
         });
         res.end();
 
@@ -187,6 +226,87 @@ router.post('/chat', async (req, res) => {
         else if (error.code === 'ECONNABORTED') errorMsg = '⚠️ Request timed out. AI server might be busy.';
 
         sendEvent({ type: 'error', error: errorMsg });
+        res.end();
+    }
+});
+
+// Resumes a conversation that paused on a `need_screen_frame` event. The
+// client has already uploaded the captured frame through the normal
+// attachments endpoint (same as any manual file attach) by the time this
+// is called — `attachment` here is that upload's returned metadata
+// ({filename, storedFilename, size}), not raw image bytes.
+router.post('/chat/continue', async (req, res) => {
+    const CONFIG = getSettings();
+    const { conversationId, toolCallId, attachment, screenSessionActive } = req.body;
+
+    if (!conversationId) return res.status(400).json({ error: 'conversationId is required.' });
+    if (!toolCallId) return res.status(400).json({ error: 'toolCallId is required.' });
+    if (!attachment?.storedFilename) return res.status(400).json({ error: 'attachment is required.' });
+
+    const conversation = loadConversation(conversationId);
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
+
+    // Sanity check: the last message should be the assistant's pending
+    // tool_calls message with a matching, unanswered call id. Guards
+    // against a stale/duplicate continue request (e.g. a retried request
+    // after a flaky connection) silently corrupting the conversation.
+    const lastMessage = conversation.messages[conversation.messages.length - 1];
+    const pendingCall = lastMessage?.role === 'assistant'
+        && lastMessage.tool_calls?.find(c => c.id === toolCallId);
+    if (!pendingCall) {
+        return res.status(409).json({ error: 'No matching pending tool call on this conversation — it may have already been resolved.' });
+    }
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    if (res.flushHeaders) res.flushHeaders();
+
+    function sendEvent(event) {
+        res.write(JSON.stringify(event) + '\n');
+    }
+
+    // Same shape as the __viewImage injection in toolCallLoop.js — a
+    // lightweight tool ack (every tool_call_id needs one) followed by a
+    // lean user-role turn carrying the attachment metadata. Expansion into
+    // real image bytes happens the normal way, via buildExpandedMessages,
+    // the same path any user-uploaded attachment already goes through —
+    // no special-casing needed there since this went through the same
+    // upload endpoint as a manual attach.
+    conversation.messages.push({
+        role: 'tool',
+        tool_call_id: toolCallId,
+        content: JSON.stringify({ ok: true, note: 'Screen frame captured — see below.' }),
+    });
+    conversation.messages.push({
+        role: 'user',
+        content: '[Screen frame captured]',
+        attachments: [attachment],
+    });
+    const messageCountBeforeThisTurn = conversation.messages.length - 1;
+
+    try {
+        const toolConfig = { ...CONFIG, conversationId, screenSessionActive: Boolean(screenSessionActive) };
+
+        await runTurnAndRespond({
+            conversation,
+            toolConfig,
+            sendEvent,
+            CONFIG,
+            messageCountBeforeThisTurn,
+            userTextForMemoryJobs: null, // no new user-authored text this turn — see runTurnAndRespond
+        });
+        res.end();
+
+    } catch (error) {
+        if (CONFIG.DEBUG) {
+            console.error('❌ AI API Error (continue):', error.message);
+            console.error('Response:', error.response?.data);
+        }
+
+        conversation.messages.length = messageCountBeforeThisTurn;
+        saveConversation(conversation);
+
+        sendEvent({ type: 'error', error: `⚠️ AI Error: ${error.message}` });
         res.end();
     }
 });

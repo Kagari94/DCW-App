@@ -2,18 +2,9 @@
 // server/lib/toolCallLoop.js — model-agnostic tool-calling round-trip loop
 // ============================================
 const axios = require('axios');
-const http = require('http');
-const https = require('https');
 const { getToolDefinitions, getToolHandlers } = require('../tools');
 const { buildExpandedMessages } = require('./attachmentProcessor.js');
-
-// keepAlive:false deliberately. Node 19+ turns keep-alive ON by default for
-// the global agent, so requests reuse pooled sockets — and a socket the LLM
-// server has already decided to close will accept the write and then drop,
-// surfacing as "socket hang up" (ECONNRESET). A fresh connection per request
-// avoids the race. The extra handshake is negligible next to inference time.
-const noKeepAliveHttp = new http.Agent({ keepAlive: false });
-const noKeepAliveHttps = new https.Agent({ keepAlive: false });
+const { defaultHttpAgent, getHttpsAgent } = require('./httpAgents.js');
 
 function isConnectionReset(err) {
     return err.code === 'ECONNRESET' || err.message === 'socket hang up';
@@ -84,8 +75,12 @@ function streamOnce(requestBody, config, onContentDelta, onFirstDelta) {
             ...(config.API_KEY && { Authorization: `Bearer ${config.API_KEY}` }),
         },
         responseType: 'stream',
-        httpAgent: noKeepAliveHttp,
-        httpsAgent: noKeepAliveHttps,
+        httpAgent: defaultHttpAgent,
+        // CA_CERT_PATH lets a specific provider (e.g. a LAN endpoint behind
+        // a self-signed reverse proxy) pin trust to one cert, without
+        // weakening verification for every other HTTPS call. See
+        // settings.js's deriveModelConfig and httpAgents.js.
+        httpsAgent: getHttpsAgent(config.CA_CERT_PATH),
         proxy: false, // else axios silently honors HTTP_PROXY/HTTPS_PROXY env
                       // vars — same reasoning as tools/handlers/web.js
     }).then(response => new Promise((resolve, reject) => {
@@ -199,6 +194,11 @@ async function callModel(messages, config, onContentDelta) {
 // `messages` is now expected to be the LEAN, persisted-form array
 // (conversation.messages itself, mutated directly) — not a pre-expanded
 // copy. Expansion happens fresh inside callModel on every iteration.
+//
+// Return shape is one of two things now:
+//   { message, uiEvents }                          — normal completion
+//   { needsScreenFrame: { toolCallId }, uiEvents }  — paused, waiting on
+//                                                      the client (see below)
 async function runWithTools(messages, config, onContentDelta) {
     const toolHandlers = getToolHandlers();
     const uiEvents = [];
@@ -231,15 +231,6 @@ async function runWithTools(messages, config, onContentDelta) {
 
             if (result && result.ui) uiEvents.push(result.ui);
 
-            // A tool wants to show the model an actual image, not just
-            // return text. Give the tool call a normal (lightweight) ack so
-            // every tool_call_id still gets a matching tool-role reply (some
-            // models require this), then push a separate, lean, path-only
-            // user turn — identical in shape to a real user-uploaded
-            // attachment — right after it. That turn gets expanded into
-            // real image bytes automatically on the next loop iteration's
-            // callModel call, and persists as lean metadata, same as any
-            // other attachment.
             if (result && result.__viewImage) {
                 const img = result.__viewImage;
                 messages.push({
@@ -258,6 +249,10 @@ async function runWithTools(messages, config, onContentDelta) {
                     }],
                 });
                 continue;
+            }
+
+            if (result && result.__needScreenFrame) {
+                return { needsScreenFrame: { toolCallId: call.id }, uiEvents };
             }
 
             messages.push({

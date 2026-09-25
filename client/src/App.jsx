@@ -1,62 +1,80 @@
 import { useRef, useState, useEffect } from 'react';
 import { authHeaders } from './utils/authToken';
+import { apiFetch } from './apiConfig';
 import ChatBox from './components/ChatBox';
 import CharacterCanvas from './components/CharacterCanvas';
 import DraggableWindow from './components/DraggableWindow';
 import SettingsPanel from './components/SettingsPanel';
 import WeatherPanel from './components/WeatherPanel';
+import AnkiWindow from './components/AnkiWindow';
 import ConversationList from './components/ConversationList';
 import ToolsMenu from './components/ToolsMenu';
 import LoginGate from './components/LoginGate';
 import useVoice from './hooks/useVoice';
 import useLipSync from './hooks/useLipSync';
+import useReminderStream from './hooks/useReminderStream';
+import useLiveCamera from './hooks/useLiveCamera';
 import { extractTag, cleanTextForVoice, getSafeDisplayPrefix } from './utils/textParsing';
 import './App.css';
 
+// If no chat activity (a real user send, or an assistant reply in
+// progress) has happened in this long, the heartbeat's proactive nudge is
+// allowed to speak up — otherwise it'd interrupt an ongoing exchange. NOT
+// used for camera escalations, which are deliberately never idle-gated —
+// see handleCameraNotable below.
+const IDLE_THRESHOLD_MS = 5 * 60 * 1000;
+const TOAST_DURATION_MS = 8000;
+
 function App() {
     const characterRef = useRef(null);
+    const chatBoxRef = useRef(null);
     const { playVoice, resetPlaybackSchedule, enqueueSentence, waitForPlaybackToFinish } = useVoice();
     const { startLipSync, stopLipSync } = useLipSync(characterRef);
+    const liveCamera = useLiveCamera();
     const [settings, setSettings] = useState(null);
     const [showSettings, setShowSettings] = useState(false);
     const [activeConversationId, setActiveConversationId] = useState(null);
     const [activeConversationTitle, setActiveConversationTitle] = useState(null);
     const [backgroundColor, setBackgroundColor] = useState('#1a1a1a');
     const [weatherPanel, setWeatherPanel] = useState(null);
+    const [ankiWindowOpen, setAnkiWindowOpen] = useState(false);
+    const [toast, setToast] = useState(null);
     const initConversationRef = useRef(false);
+    const cameraInitRef = useRef(false);
+    const lastActivityRef = useRef(Date.now());
 
     const tagsHandledRef = useRef(false);
     const spokenPointerRef = useRef(0);
     const replyInProgressRef = useRef(false);
 
-    // Screen-capture session — lives here (not in ChatBox) since the toggle
-    // button sits in the window header alongside ToolsMenu, outside
-    // ChatBox's own render tree. The stream stays open across multiple
-    // messages once started (see startScreenSession's comment) — ChatBox
-    // just asks for a frame via grabScreenFrame() when it decides one is
-    // needed, it never owns the capture itself.
     const [screenSessionActive, setScreenSessionActive] = useState(false);
     const screenStreamRef = useRef(null);
     const screenVideoRef = useRef(null);
 
     useEffect(() => {
-        fetch(`http://${window.location.hostname}:3000/api/settings`, {
-            headers: authHeaders(),
-        })
+        apiFetch('/api/settings', { headers: authHeaders() })
             .then(r => r.json())
             .then((data) => {
                 setSettings(data);
                 if (data.backgroundColor) setBackgroundColor(data.backgroundColor);
+
+                // Camera gatekeeper "remembers" being on across restarts —
+                // start it automatically here if it was left enabled, but
+                // only once (cameraInitRef), and only from this initial
+                // settings load, not on every settings refresh afterward.
+                if (data.cameraGatekeeper?.enabled && !cameraInitRef.current) {
+                    cameraInitRef.current = true;
+                    liveCamera.start();
+                }
             });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     useEffect(() => {
         if (activeConversationId || initConversationRef.current) return;
         initConversationRef.current = true;
 
-        fetch(`http://${window.location.hostname}:3000/api/conversations`, {
-            headers: authHeaders(),
-        })
+        apiFetch('/api/conversations', { headers: authHeaders() })
             .then(r => r.json())
             .then(({ conversations }) => {
                 const reusable = conversations?.find(c => c.title === 'New conversation');
@@ -65,7 +83,7 @@ function App() {
                     return;
                 }
 
-                return fetch(`http://${window.location.hostname}:3000/api/conversations`, {
+                return apiFetch('/api/conversations', {
                     method: 'POST',
                     headers: authHeaders(),
                 })
@@ -74,12 +92,66 @@ function App() {
             });
     }, []);
 
-    // Stop sharing automatically whenever the active conversation changes,
-    // or on unmount — a live screen-capture stream should never silently
-    // outlive the conversation it was started under.
     useEffect(() => {
         return () => stopScreenSession();
     }, [activeConversationId]);
+
+    // Auto-dismiss the toast after TOAST_DURATION_MS.
+    useEffect(() => {
+        if (!toast) return;
+        const t = setTimeout(() => setToast(null), TOAST_DURATION_MS);
+        return () => clearTimeout(t);
+    }, [toast]);
+
+    // Anki due-cards heartbeat (server/lib/heartbeat/checks/ankiDueCards.js)
+    // pushes a 'due_cards' event over /api/events whenever there's a new or
+    // grown backlog worth surfacing. Always shows the toast; ALSO has the
+    // AI mention it in chat, but only if the user's been idle for a while —
+    // never interrupts an active exchange.
+    //
+    // 'camera_notable' (server/routes/vision.js) is handled differently on
+    // purpose: the gatekeeper model is explicitly instructed to be
+    // conservative and only escalate for something genuinely worth
+    // interrupting for, so an escalation always triggers the chat nudge
+    // immediately, regardless of idle state — idle-gating it would defeat
+    // the point of the feature.
+    useReminderStream((event) => {
+        if (event.type === 'due_cards') {
+            const cardWord = event.dueCount === 1 ? 'card is' : 'cards are';
+            setToast({ message: `📇 ${event.dueCount} Anki ${cardWord} due for review.` });
+
+            const idleFor = Date.now() - lastActivityRef.current;
+            if (idleFor >= IDLE_THRESHOLD_MS) {
+                chatBoxRef.current?.triggerSystemNudge(
+                    `[System note: ${event.dueCount} Anki flashcard${event.dueCount === 1 ? '' : 's'} ` +
+                    `${event.dueCount === 1 ? 'is' : 'are'} due for review. Mention this casually, and offer ` +
+                    `to start a review session if they'd like.]`
+                );
+            }
+        } else if (event.type === 'camera_notable') {
+            lastActivityRef.current = Date.now();
+            setToast({ message: `📷 ${event.description}` });
+            chatBoxRef.current?.triggerSystemNudge(
+                `[System note: the background camera monitor noticed something worth mentioning: ` +
+                `"${event.description}". Bring it up naturally.]`
+            );
+        }
+    });
+
+    function toggleCameraGatekeeper() {
+        const next = !liveCamera.active;
+        if (next) liveCamera.start();
+        else liveCamera.stop();
+
+        apiFetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({ cameraGatekeeper: { enabled: next } }),
+        })
+            .then(r => r.json())
+            .then(setSettings)
+            .catch(err => console.error('Failed to save camera gatekeeper setting:', err));
+    }
 
     async function startScreenSession() {
         if (!navigator.mediaDevices?.getDisplayMedia) {
@@ -95,9 +167,6 @@ function App() {
             await video.play();
             screenVideoRef.current = video;
 
-            // Fires if the person stops sharing via the browser's own native
-            // indicator rather than our button — keeps our state honest
-            // either way.
             stream.getVideoTracks()[0].addEventListener('ended', () => {
                 stopScreenSession();
             });
@@ -118,9 +187,6 @@ function App() {
         setScreenSessionActive(false);
     }
 
-    // Grabs a frame from the already-open session stream — no permission
-    // prompt, since the stream was authorized once at startScreenSession().
-    // Returns null if no session is active.
     async function grabScreenFrame() {
         const video = screenVideoRef.current;
         if (!video) return null;
@@ -136,6 +202,8 @@ function App() {
     }
 
     function handleReplyChunk(rawTextSoFar, { done }) {
+        lastActivityRef.current = Date.now();
+
         const character = characterRef.current;
         const streamingVoiceEnabled = settings?.ttsBackend === 'pocket-tts' && settings?.pocketTts?.streaming;
 
@@ -202,11 +270,13 @@ function App() {
 
     function handleUiEvents(events) {
         for (const event of events) {
-            if (!event || event.window !== 'weather') continue;
-            if (event.action === 'show') {
-                setWeatherPanel(event.data || null);
-            } else if (event.action === 'hide') {
-                setWeatherPanel(null);
+            if (!event) continue;
+            if (event.window === 'weather') {
+                if (event.action === 'show') setWeatherPanel(event.data || null);
+                else if (event.action === 'hide') setWeatherPanel(null);
+            } else if (event.window === 'anki') {
+                if (event.action === 'show') setAnkiWindowOpen(true);
+                else if (event.action === 'hide') setAnkiWindowOpen(false);
             }
         }
     }
@@ -225,9 +295,19 @@ function App() {
         setActiveConversationTitle(null);
     }
 
+    function handleDiscussCard(card, correct, userAnswer) {
+        lastActivityRef.current = Date.now();
+        chatBoxRef.current?.triggerSystemNudge(
+            `[System note: reviewing an Anki flashcard. Front: "${card.front}". ` +
+            `User answered: "${userAnswer}". This was ${correct ? 'CORRECT' : 'INCORRECT'}` +
+            `${correct ? '' : ` (correct answer: "${card.back}")`}. ` +
+            `Briefly and conversationally react — an example sentence, a tip, or encouragement fits well. Keep it short.]`
+        );
+    }
+
     return (
         <LoginGate>
-            <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', background: backgroundColor }}>
+            <div className="app-root" style={{ '--bg-color': backgroundColor }}>
                 <CharacterCanvas
                     ref={characterRef}
                     characterFile={settings?.currentCharacter}
@@ -240,7 +320,7 @@ function App() {
                     initialY={40}
                     width={410}
                     headerExtra={
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div className="window-header-extra">
                             <ConversationList
                                 activeId={activeConversationId}
                                 activeTitle={activeConversationTitle}
@@ -258,16 +338,34 @@ function App() {
                             >
                                 🖥️
                             </button>
+                            <button
+                                type="button"
+                                onClick={toggleCameraGatekeeper}
+                                title={liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring'}
+                                className={`tools-menu-toggle${liveCamera.active ? ' screen-session-active' : ''}`}
+                            >
+                                📷
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setAnkiWindowOpen(o => !o)}
+                                title={ankiWindowOpen ? 'Close review' : 'Review flashcards'}
+                                className={`tools-menu-toggle${ankiWindowOpen ? ' screen-session-active' : ''}`}
+                            >
+                                📇
+                            </button>
                             <ToolsMenu />
                         </div>
                     }
                 >
                     <ChatBox
+                        ref={chatBoxRef}
                         conversationId={activeConversationId}
                         settings={settings}
                         onReplyChunk={handleReplyChunk}
                         onUiEvents={handleUiEvents}
                         onConversationUpdated={handleConversationUpdated}
+                        onUserActivity={() => { lastActivityRef.current = Date.now(); }}
                         screenSessionActive={screenSessionActive}
                         onGrabScreenFrame={grabScreenFrame}
                         onStopScreenSession={stopScreenSession}
@@ -283,15 +381,7 @@ function App() {
                         headerExtra={
                             <button
                                 onClick={() => setWeatherPanel(null)}
-                                style={{
-                                    background: 'none',
-                                    border: '1px solid #555',
-                                    borderRadius: 4,
-                                    color: '#aaa',
-                                    cursor: 'pointer',
-                                    fontSize: 12,
-                                    padding: '2px 8px',
-                                }}
+                                className="weather-panel-close-btn"
                             >
                                 Close
                             </button>
@@ -301,14 +391,28 @@ function App() {
                     </DraggableWindow>
                 )}
 
+                {ankiWindowOpen && (
+                    <DraggableWindow
+                        title="Flashcard Review"
+                        initialX={Math.max(window.innerWidth - 380, 280)}
+                        initialY={80}
+                        width={340}
+                        headerExtra={
+                            <button
+                                onClick={() => setAnkiWindowOpen(false)}
+                                className="weather-panel-close-btn"
+                            >
+                                Close
+                            </button>
+                        }
+                    >
+                        <AnkiWindow onDiscussCard={handleDiscussCard} />
+                    </DraggableWindow>
+                )}
+
                 <button
                     onClick={() => setShowSettings(s => !s)}
-                    style={{
-                        position: 'absolute', top: 12, right: 12, zIndex: 20,
-                        background: 'rgba(20,20,20,0.85)', color: '#ddd',
-                        border: '1px solid #444', borderRadius: 6,
-                        padding: '6px 10px', cursor: 'pointer', fontSize: 13,
-                    }}
+                    className="settings-toggle-btn"
                 >
                     ⚙ Settings
                 </button>
@@ -317,6 +421,20 @@ function App() {
                     <DraggableWindow title="Settings" initialX={window.innerWidth - 380} initialY={60} width={340}>
                         <SettingsPanel onSettingsChange={handleSettingsChange} />
                     </DraggableWindow>
+                )}
+
+                {toast && (
+                    <div className="reminder-toast" role="status">
+                        <span>{toast.message}</span>
+                        <button
+                            type="button"
+                            className="reminder-toast-dismiss"
+                            onClick={() => setToast(null)}
+                            aria-label="Dismiss"
+                        >
+                            ✕
+                        </button>
+                    </div>
                 )}
             </div>
         </LoginGate>

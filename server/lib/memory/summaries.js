@@ -131,16 +131,36 @@ async function finalizeSummary(conversation, config) {
         // Embed the final summary as one retrievable chunk — final
         // summaries only (not raw messages), so the vector store stays
         // small and each row maps cleanly to "one past conversation."
+        //
+        // The embed call happens BEFORE the transaction opens (embedding
+        // is async and can be slow on first use — model download/load —
+        // and a node:sqlite transaction should stay short and
+        // synchronous). Only the two INSERTs are wrapped, so a failure
+        // between them can never leave an orphaned chunk-with-no-vector
+        // (which retrieval would silently never find, forever) or a
+        // vector-with-no-chunk (which would surface as a dangling match
+        // during retrieval).
+        const vector = await embedText(finalSummary);
+        const vecBuffer = toVecBuffer(vector);
+
         const db = getDb();
         const now = new Date().toISOString();
-        const info = db.prepare(`
-            INSERT INTO memory_chunks (conversation_id, chunk_text, created_at)
-            VALUES (?, ?, ?)
-        `).run(conversation.id, finalSummary, now);
 
-        const vector = await embedText(finalSummary);
-        db.prepare(`INSERT INTO memory_vectors (rowid, embedding) VALUES (?, ?)`)
-            .run(info.lastInsertRowid, toVecBuffer(vector));
+        db.exec('BEGIN');
+        try {
+            const info = db.prepare(`
+                INSERT INTO memory_chunks (conversation_id, chunk_text, created_at)
+                VALUES (?, ?, ?)
+            `).run(conversation.id, finalSummary, now);
+
+            db.prepare(`INSERT INTO memory_vectors (rowid, embedding) VALUES (?, ?)`)
+                .run(info.lastInsertRowid, vecBuffer);
+
+            db.exec('COMMIT');
+        } catch (err) {
+            db.exec('ROLLBACK');
+            throw err;
+        }
     } catch (err) {
         console.error('⚠️ Final summarization failed (non-fatal):', err.message);
     }

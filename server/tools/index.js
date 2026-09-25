@@ -7,12 +7,14 @@ const weather = require('./handlers/weather.js');
 const web = require('./handlers/web.js');
 const documents = require('./handlers/documents.js');
 const filesystem = require('./handlers/filesystem.js');
+const screen = require('./handlers/screen.js');
+const ankiReview = require('./handlers/ankiReview.js');
 const { loadMcpTools } = require('./mcpClients.js');
 
 
 
 // Add new local (non-MCP) tool files here — one line, that's the only edit point.
-const localToolModules = [music, alarms, weather, web, documents, filesystem];
+const localToolModules = [music, alarms, weather, web, documents, filesystem, screen, ankiReview];
 let toolDefinitions = [];
 let toolHandlers = {};
 let toolSummaries = [];

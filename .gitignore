@@ -23,6 +23,7 @@ client/public/animations
 /animation-studio
 /start-all.ps1
 client\README.ai.md
+server/certs
 
 # Editor directories and files
 .vscode/*

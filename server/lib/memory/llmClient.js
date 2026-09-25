@@ -2,19 +2,7 @@
 // server/lib/memory/llmClient.js — shared LLM caller for background memory jobs
 // ============================================
 const axios = require('axios');
-const http = require('http');
-const https = require('https');
-
-// keepAlive:false deliberately. Node reuses idle sockets by default, and
-// these background calls fire immediately after a streaming chat reply
-// finishes — so they tend to grab the very socket that just carried the
-// stream. If the LLM server has already decided to close that connection,
-// the write lands on a dying socket and surfaces as "socket hang up"
-// (ECONNRESET). A fresh connection per request avoids the race entirely.
-// The extra handshake cost is irrelevant here: these run once per turn in
-// the background, not in a hot loop.
-const noKeepAliveHttp = new http.Agent({ keepAlive: false });
-const noKeepAliveHttps = new https.Agent({ keepAlive: false });
+const { defaultHttpAgent, getHttpsAgent } = require('../httpAgents.js');
 
 // Connection was dropped rather than answered — the server was reachable
 // and accepted the socket, then closed it. Worth one retry. Deliberately
@@ -31,8 +19,8 @@ async function callLlm(messages, config, { timeout = 30000 } = {}) {
             ...(config.API_KEY && { Authorization: `Bearer ${config.API_KEY}` }),
         },
         timeout,
-        httpAgent: noKeepAliveHttp,
-        httpsAgent: noKeepAliveHttps,
+        httpAgent: defaultHttpAgent,
+        httpsAgent: getHttpsAgent(config.CA_CERT_PATH),
         proxy: false, // else axios silently honors HTTP_PROXY/HTTPS_PROXY env
                       // vars and routes this somewhere unintended — same
                       // reasoning as tools/handlers/web.js

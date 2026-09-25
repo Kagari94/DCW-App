@@ -1,33 +1,19 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import { authHeaders } from '../utils/authToken';
+import { apiFetch } from '../apiConfig';
 import { blobToWav16kMono } from '../utils/audioCapture';
 import { playWakeAcknowledgeChime } from '../utils/chime';
 
-const API_BASE = `http://${window.location.hostname}:3000/api`;
 const DEFAULT_COMMAND_MODEL = 'Xenova/whisper-base.en';
 const DEFAULT_POLL_MODEL = 'Xenova/whisper-tiny.en';
 
-// Handles both voice-input modes off one `settings.voiceInput` config:
-//   - push-to-talk: caller explicitly starts/stops one recording via the
-//     returned functions, gets one transcript back through onCommand()
-//   - wake-word: runs entirely on its own once enabled — continuously
-//     records rolling ~4s chunks using a CHEAP model (wakeWordPollModel,
-//     default tiny) so constant background listening isn't as expensive as
-//     running the full configured model nonstop. Only the one chunk right
-//     after the wake word is heard uses the more accurate whisperModel,
-//     since that's the part whose accuracy actually matters.
-//
-// `onCommand` should be a STABLE reference (wrap it in useCallback with a
-// ref-to-latest-logic if what it does depends on frequently-changing state)
-// — it's a dependency of the wake-word effect below, so a new identity every
-// render tears down and reopens the mic stream on every unrelated re-render.
 export default function useVoiceInput(settings, onCommand) {
     const [isListening, setIsListening] = useState(false);
     const [isTranscribing, setIsTranscribing] = useState(false);
-    const [awaitingCommand, setAwaitingCommand] = useState(false); // wake word heard, waiting on the actual command chunk
+    const [awaitingCommand, setAwaitingCommand] = useState(false);
     const mediaRecorderRef = useRef(null);
     const streamRef = useRef(null);
-    const wakeWordActiveRef = useRef(false); // mirrors awaitingCommand but synchronous, for use inside the recording loop
+    const wakeWordActiveRef = useRef(false);
 
     const voiceConfig = settings?.voiceInput;
 
@@ -37,7 +23,7 @@ export default function useVoiceInput(settings, onCommand) {
         formData.append('audio', wavBlob, 'clip.wav');
         if (modelOverride) formData.append('model', modelOverride);
 
-        const res = await fetch(`${API_BASE}/transcribe`, {
+        const res = await apiFetch('/api/transcribe', {
             method: 'POST',
             headers: authHeaders(),
             body: formData,
@@ -47,9 +33,8 @@ export default function useVoiceInput(settings, onCommand) {
         return data.text || '';
     }, []);
 
-    // ---- Push-to-talk ----
     const startPushToTalk = useCallback(async () => {
-        if (mediaRecorderRef.current) return; // already recording
+        if (mediaRecorderRef.current) return;
 
         let stream;
         try {
@@ -73,8 +58,6 @@ export default function useVoiceInput(settings, onCommand) {
             if (chunks.length === 0) return;
             setIsTranscribing(true);
             try {
-                // Push-to-talk always uses the main configured model (or its
-                // default) — no override needed, this isn't the polling path.
                 const text = await transcribeBlob(new Blob(chunks));
                 if (text) onCommand(text, 'push-to-talk');
             } catch (err) {
@@ -95,7 +78,6 @@ export default function useVoiceInput(settings, onCommand) {
         }
     }, []);
 
-    // ---- Wake word (continuous rolling chunks) ----
     useEffect(() => {
         if (!voiceConfig?.enabled || voiceConfig.mode !== 'wake-word') return;
 
@@ -116,19 +98,14 @@ export default function useVoiceInput(settings, onCommand) {
 
             if (!wakeWordActiveRef.current) {
                 const idx = lower.indexOf(wakeWord);
-                if (idx === -1) return; // wake word not heard this chunk — keep polling cheaply
+                if (idx === -1) return;
 
                 playWakeAcknowledgeChime();
 
                 const after = text.slice(idx + wakeWord.length).trim();
                 if (after) {
-                    // Wake word + command landed in the same chunk — already
-                    // transcribed with the poll (tiny) model in this case, so
-                    // accuracy is a little lower, but it's the fast path.
                     onCommand(after, 'wake-word');
                 } else {
-                    // Wake word alone this chunk — the NEXT chunk is the
-                    // command, and will use the more accurate model.
                     wakeWordActiveRef.current = true;
                     setAwaitingCommand(true);
                 }
@@ -142,10 +119,6 @@ export default function useVoiceInput(settings, onCommand) {
         function recordOneChunk() {
             if (cancelled || !stream) return;
 
-            // Decided BEFORE this chunk records: if the previous chunk just
-            // heard the wake word, this chunk is the actual command, so use
-            // the accurate model; otherwise it's routine polling, use the
-            // cheap one.
             const modelForThisChunk = wakeWordActiveRef.current ? commandModel : pollModel;
 
             const chunks = [];
@@ -154,14 +127,6 @@ export default function useVoiceInput(settings, onCommand) {
             recorder.onstop = () => {
                 if (cancelled) return;
 
-                // Start the NEXT chunk recording immediately — before this
-                // chunk's transcription even begins — so there's no dead air
-                // while waiting on the network/inference round trip. Previously
-                // this awaited transcribeBlob() first, which left a real gap
-                // (often 1+ second) where the mic simply wasn't recording;
-                // anything you said in that gap was lost, and Whisper's classic
-                // hallucination on near-silent leftover audio is a stray "."
-                // or "you" — which is exactly what was showing up in chat.
                 recordOneChunk();
 
                 if (chunks.length > 0) {

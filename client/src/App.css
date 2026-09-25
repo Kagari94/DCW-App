@@ -18,12 +18,26 @@
     animation: blink 1.4s infinite;
     opacity: 0;
 }
-.dots span:nth-child(2) { animation-delay: 0.2s; }
-.dots span:nth-child(3) { animation-delay: 0.4s; }
+
+.dots span:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.dots span:nth-child(3) {
+    animation-delay: 0.4s;
+}
 
 @keyframes blink {
-    0%, 80%, 100% { opacity: 0; }
-    40% { opacity: 1; }
+
+    0%,
+    80%,
+    100% {
+        opacity: 0;
+    }
+
+    40% {
+        opacity: 1;
+    }
 }
 
 /* ---------- Chat container / log ---------- */
@@ -161,9 +175,17 @@
     border-top: 1px solid var(--border-subtle);
 }
 
-.voice-status-active { color: var(--accent-color); }
-.voice-status-listening { color: var(--link-color); }
-.voice-status-off { color: var(--text-faint); }
+.voice-status-active {
+    color: var(--accent-color);
+}
+
+.voice-status-listening {
+    color: var(--link-color);
+}
+
+.voice-status-off {
+    color: var(--text-faint);
+}
 
 .mic-active {
     background: var(--accent-color) !important;
@@ -175,8 +197,15 @@
     margin: 0 0 4px;
     color: var(--text-bright);
 }
-.md-heading-1 { font-size: 1.05em; }
-.md-heading-2 { font-size: 1.02em; }
+
+.md-heading-1 {
+    font-size: 1.05em;
+}
+
+.md-heading-2 {
+    font-size: 1.02em;
+}
+
 .md-heading-3 {
     font-size: 1em;
     color: var(--text-heading-3);
@@ -348,8 +377,9 @@
 .settings-label {
     display: block;
     margin-bottom: 6px;
-    color: var(--text-faint);
+    color: var(--text-primary);
     font-size: 12px;
+    font-weight: bold;
 }
 
 .settings-label-spaced {
@@ -552,6 +582,16 @@
     color: var(--text-faintest);
 }
 
+.weather-panel-close-btn {
+    background: none;
+    border: 1px solid #555;
+    border-radius: 4px;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 8px;
+}
+
 /* ---------- LLM Provider section ---------- */
 .provider-summary {
     display: flex;
@@ -574,6 +614,20 @@
     justify-content: space-between;
 }
 
+.settings-toggle-btn {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 20;
+    background: rgba(20, 20, 20, 0.85);
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
 .settings-refresh-btn {
     background: none;
     border: 1px solid var(--border-color);
@@ -594,9 +648,12 @@
 }
 
 @keyframes screen-pulse {
-    0%, 100% {
+
+    0%,
+    100% {
         box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.6);
     }
+
     50% {
         box-shadow: 0 0 0 6px rgba(76, 175, 80, 0);
     }
@@ -606,4 +663,93 @@
     background: var(--accent-color) !important;
     color: #fff;
     animation: screen-pulse 1.8s ease-in-out infinite;
+}
+
+.app-root {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    /* background-color set inline via --bg-color, since it's user-configurable at runtime */
+    background-color: var(--bg-color);
+}
+
+
+.window-header-extra {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.anki-window-status {
+    padding: 16px;
+    text-align: center;
+    color: #ccc;
+    font-size: 14px;
+}
+
+.anki-window-error {
+    color: #e88;
+}
+
+.anki-window {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 4px;
+}
+
+.anki-window-progress {
+    font-size: 12px;
+    color: #999;
+}
+
+.anki-card-front {
+    font-size: 20px;
+    font-weight: 600;
+    text-align: center;
+    padding: 20px 10px;
+    border: 1px solid #444;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.anki-card-deck {
+    font-size: 11px;
+    color: #888;
+    text-align: center;
+}
+
+.anki-result {
+    text-align: center;
+    font-size: 14px;
+    padding: 6px;
+    border-radius: 6px;
+}
+
+.anki-result-correct {
+    color: #7ee787;
+    background: rgba(46, 160, 67, 0.15);
+}
+
+.anki-result-incorrect {
+    color: #ff9b9b;
+    background: rgba(200, 60, 60, 0.15);
+}
+
+.anki-answer-row {
+    display: flex;
+    gap: 8px;
+}
+
+.anki-answer-row input {
+    flex: 1;
+}
+
+.anki-controls-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: #ccc;
 }

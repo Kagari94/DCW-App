@@ -1,7 +1,6 @@
 import { useRef, useCallback } from 'react';
 import { authHeaders } from '../utils/authToken';
-
-const API_BASE = `http://${window.location.hostname}:3000/api`;
+import { apiFetch } from '../apiConfig';
 
 function useVoice() {
     const audioContextRef = useRef(null);
@@ -17,12 +16,11 @@ function useVoice() {
         return audioContextRef.current;
     }
 
-    // Unchanged — Kokoro path, and the pocket-tts-without-streaming fallback.
     const playVoice = useCallback(async (text, { voice = 'af_bella', onAnalyser } = {}) => {
         const audioContext = getAudioContext();
         if (audioContext.state === 'suspended') await audioContext.resume();
 
-        const res = await fetch(`${API_BASE}/voice`, {
+        const res = await apiFetch('/api/voice', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
             body: JSON.stringify({ text, voice }),
@@ -52,10 +50,6 @@ function useVoice() {
         return new Promise((resolve) => { source.onended = resolve; });
     }, []);
 
-    // Call once at the start of a new reply — sets up a shared timeline
-    // (nextStartTimeRef) and a single analyser that every subsequent
-    // sentence connects through, so lip-sync sees one continuous signal
-    // instead of restarting at each sentence boundary.
     const resetPlaybackSchedule = useCallback(({ onAnalyser } = {}) => {
         const ctx = getAudioContext();
         nextStartTimeRef.current = ctx.currentTime;
@@ -72,16 +66,11 @@ function useVoice() {
         }
     }, []);
 
-    // Fetches + schedules ONE sentence's streamed audio onto the shared
-    // timeline. Resolves once this sentence's chunks are fetched and
-    // scheduled — NOT once they've finished playing — so the next
-    // sentence's generation can start immediately behind it rather than
-    // waiting out this one's playback.
     async function scheduleStreamedSentence(text) {
         const ctx = getAudioContext();
         if (ctx.state === 'suspended') await ctx.resume();
 
-        const res = await fetch(`${API_BASE}/voice/stream`, {
+        const res = await apiFetch('/api/voice/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
             body: JSON.stringify({ text }),
@@ -134,10 +123,6 @@ function useVoice() {
         }
     }
 
-    // Queues a sentence for generation, preserving order across the whole
-    // reply, without blocking on THIS sentence's playback — only on its
-    // generation+scheduling (matches pocket-tts's own serialized-generation
-    // constraint, doesn't add extra unnecessary waiting on top of it).
     const enqueueSentence = useCallback((text) => {
         ttsQueueRef.current = ttsQueueRef.current
             .then(() => scheduleStreamedSentence(text))
@@ -145,8 +130,6 @@ function useVoice() {
         return ttsQueueRef.current;
     }, []);
 
-    // Resolves once every queued sentence has been generated+scheduled AND
-    // the final scheduled chunk has actually finished playing.
     const waitForPlaybackToFinish = useCallback(async () => {
         await ttsQueueRef.current;
         if (!lastSourceRef.current) return;
