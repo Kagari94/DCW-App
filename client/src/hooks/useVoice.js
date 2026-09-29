@@ -2,6 +2,21 @@ import { useRef, useCallback } from 'react';
 import { authHeaders } from '../utils/authToken';
 import { apiFetch } from '../apiConfig';
 
+// Both TTS backends (Kokoro and pocket-tts) produce 24kHz audio — pocket-tts
+// confirmed via its X-Sample-Rate header (see gotcha note below), Kokoro
+// reports its own rate per-call via audio.sampling_rate. Opening the shared
+// AudioContext at 24000 explicitly, instead of letting the browser default
+// to the hardware's native rate (48000 on this Windows setup), avoids a
+// resample step entirely rather than needing to just tolerate one. A rate
+// mismatch there was confirmed as the cause of crackling specifically on
+// higher-pitched voices — browsers silently resample any AudioBuffer whose
+// declared rate differs from the context's own rate at playback time, and
+// on a splice-heavy streaming path (many small per-chunk buffers) or even
+// a single decodeAudioData() call, that resample's artifacts land mostly
+// in high-frequency content, which is exactly where a higher voice's pitch
+// sits — hence audible there and not on lower voices.
+const TARGET_SAMPLE_RATE = 24000;
+
 function useVoice() {
     const audioContextRef = useRef(null);
     const nextStartTimeRef = useRef(0);
@@ -11,11 +26,18 @@ function useVoice() {
 
     function getAudioContext() {
         if (!audioContextRef.current) {
-            audioContextRef.current = new AudioContext();
+            // If the browser/hardware can't actually honor this rate, it
+            // silently falls back to its own native rate instead of
+            // throwing — in that case we're back to one OS-level resample,
+            // which is normally cleaner than the app-level per-chunk
+            // resampling this was designed to avoid, so this is a safe
+            // request either way.
+            audioContextRef.current = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
         }
         return audioContextRef.current;
     }
 
+    // Unchanged — Kokoro path, and the pocket-tts-without-streaming fallback.
     const playVoice = useCallback(async (text, { voice = 'af_bella', onAnalyser } = {}) => {
         const audioContext = getAudioContext();
         if (audioContext.state === 'suspended') await audioContext.resume();
@@ -50,6 +72,10 @@ function useVoice() {
         return new Promise((resolve) => { source.onended = resolve; });
     }, []);
 
+    // Call once at the start of a new reply — sets up a shared timeline
+    // (nextStartTimeRef) and a single analyser that every subsequent
+    // sentence connects through, so lip-sync sees one continuous signal
+    // instead of restarting at each sentence boundary.
     const resetPlaybackSchedule = useCallback(({ onAnalyser } = {}) => {
         const ctx = getAudioContext();
         nextStartTimeRef.current = ctx.currentTime;
@@ -66,6 +92,11 @@ function useVoice() {
         }
     }, []);
 
+    // Fetches + schedules ONE sentence's streamed audio onto the shared
+    // timeline. Resolves once this sentence's chunks are fetched and
+    // scheduled — NOT once they've finished playing — so the next
+    // sentence's generation can start immediately behind it rather than
+    // waiting out this one's playback.
     async function scheduleStreamedSentence(text) {
         const ctx = getAudioContext();
         if (ctx.state === 'suspended') await ctx.resume();
@@ -82,6 +113,10 @@ function useVoice() {
         }
 
         const sampleRate = Number(res.headers.get('X-Sample-Rate')) || ctx.sampleRate;
+        // If this ever logs something other than 24000 alongside a
+        // resurfacing crackle, that's the sign pocket-tts changed its
+        // output rate (e.g. a different language bundle) and
+        // TARGET_SAMPLE_RATE above needs to move with it.
         const channels = Number(res.headers.get('X-Channels')) || 1;
 
         const reader = res.body.getReader();
@@ -123,6 +158,10 @@ function useVoice() {
         }
     }
 
+    // Queues a sentence for generation, preserving order across the whole
+    // reply, without blocking on THIS sentence's playback — only on its
+    // generation+scheduling (matches pocket-tts's own serialized-generation
+    // constraint, doesn't add extra unnecessary waiting on top of it).
     const enqueueSentence = useCallback((text) => {
         ttsQueueRef.current = ttsQueueRef.current
             .then(() => scheduleStreamedSentence(text))
@@ -130,6 +169,8 @@ function useVoice() {
         return ttsQueueRef.current;
     }, []);
 
+    // Resolves once every queued sentence has been generated+scheduled AND
+    // the final scheduled chunk has actually finished playing.
     const waitForPlaybackToFinish = useCallback(async () => {
         await ttsQueueRef.current;
         if (!lastSourceRef.current) return;

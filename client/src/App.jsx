@@ -2,6 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import { authHeaders } from './utils/authToken';
 import { apiFetch } from './apiConfig';
 import ChatBox from './components/ChatBox';
+import OverflowIconBar from './components/OverflowIconBar';
 import CharacterCanvas from './components/CharacterCanvas';
 import DraggableWindow from './components/DraggableWindow';
 import SettingsPanel from './components/SettingsPanel';
@@ -90,7 +91,7 @@ function App() {
                     .then(r => r.json())
                     .then(c => setActiveConversationId(c.id));
             });
-    }, []);
+    }, [activeConversationId]);
 
     useEffect(() => {
         return () => stopScreenSession();
@@ -330,35 +331,59 @@ function App() {
                                     setActiveConversationTitle(null);
                                 }}
                             />
-                            <button
-                                type="button"
-                                onClick={screenSessionActive ? stopScreenSession : startScreenSession}
-                                title={screenSessionActive ? 'Stop screen sharing' : 'Start screen sharing session'}
-                                className={`tools-menu-toggle${screenSessionActive ? ' screen-session-active' : ''}`}
-                            >
-                                🖥️
-                            </button>
-                            <button
-                                type="button"
-                                onClick={toggleCameraGatekeeper}
-                                title={liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring'}
-                                className={`tools-menu-toggle${liveCamera.active ? ' screen-session-active' : ''}`}
-                            >
-                                📷
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setAnkiWindowOpen(o => !o)}
-                                title={ankiWindowOpen ? 'Close review' : 'Review flashcards'}
-                                className={`tools-menu-toggle${ankiWindowOpen ? ' screen-session-active' : ''}`}
-                            >
-                                📇
-                            </button>
-                            <ToolsMenu />
+                            <OverflowIconBar
+                                storageKey="header-icons"
+                                items={[
+                                    {
+                                        id: 'screen',
+                                        title: screenSessionActive ? 'Stop screen sharing' : 'Start screen sharing session',
+                                        content: (
+                                            <button
+                                                type="button"
+                                                onClick={screenSessionActive ? stopScreenSession : startScreenSession}
+                                                title={screenSessionActive ? 'Stop screen sharing' : 'Start screen sharing session'}
+                                                className={`tools-menu-toggle${screenSessionActive ? ' screen-session-active' : ''}`}
+                                            >
+                                                🖥️
+                                            </button>
+                                        ),
+                                    },
+                                    {
+                                        id: 'camera',
+                                        title: liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring',
+                                        content: (
+                                            <button
+                                                type="button"
+                                                onClick={toggleCameraGatekeeper}
+                                                title={liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring'}
+                                                className={`tools-menu-toggle${liveCamera.active ? ' screen-session-active' : ''}`}
+                                            >
+                                                📷
+                                            </button>
+                                        ),
+                                    },
+                                    {
+                                        id: 'anki',
+                                        title: ankiWindowOpen ? 'Close review' : 'Review flashcards',
+                                        content: (
+                                            <button
+                                                type="button"
+                                                onClick={() => setAnkiWindowOpen(o => !o)}
+                                                title={ankiWindowOpen ? 'Close review' : 'Review flashcards'}
+                                                className={`tools-menu-toggle${ankiWindowOpen ? ' screen-session-active' : ''}`}
+                                            >
+                                                📇
+                                            </button>
+                                        ),
+                                    },
+                                    { id: 'tools', title: 'Tools available to the AI', content: <ToolsMenu />, menuContent: <ToolsMenu embedded /> },
+                                ]}
+                            />
                         </div>
                     }
                 >
                     <ChatBox
+                        key={activeConversationId}
                         ref={chatBoxRef}
                         conversationId={activeConversationId}
                         settings={settings}
@@ -368,7 +393,6 @@ function App() {
                         onUserActivity={() => { lastActivityRef.current = Date.now(); }}
                         screenSessionActive={screenSessionActive}
                         onGrabScreenFrame={grabScreenFrame}
-                        onStopScreenSession={stopScreenSession}
                     />
                 </DraggableWindow>
 

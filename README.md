@@ -37,23 +37,35 @@ rather.
 - **LLM inference:** LM Studio (local) or any OpenAI-compatible API
 - **3D:** Three.js + `@pixiv/three-vrm`
 - **Voice:** Whisper (speech-to-text), Kokoro / Pocket TTS (text-to-speech)
-- **Memory:** SQLite (via Node's built-in `node:sqlite`) + `sqlite-vec` for
-  vector search, `transformers.js` for local embeddings
+- **Memory:** SQLite (via Node's built-in `node:sqlite`) with FTS5 text search
 
 ## Getting started
 
-1. `npm install` in both `client/` and `server/`
-2. Point the server at your LLM provider — either edit `server/config.js`
-   directly, or run the app once and set it from the Settings panel's AI
-   Provider section. Defaults assume LM Studio at
-   `http://localhost:1234/v1/chat/completions`.
-3. Start both the client and server dev processes (check each folder's
-   `package.json` for the exact script names/ports in your setup).
-4. Open the app, pick a VRM character under Settings, and start chatting.
+Use Node 22.13+ (the memory database uses `node:sqlite`). From the repository root:
 
-> Node 22.13+ is required for the memory system (it uses Node's built-in
-> `node:sqlite`). If you're on an older Node, upgrade first — `node -v` to
-> check.
+```sh
+npm install
+npm install --prefix client
+npm start
+```
+
+In a second terminal run `npm run dev:client` and open the URL Vite prints.
+Enter the access token printed by the backend. Configure the model provider in
+Settings; the default endpoint is `http://localhost:1234/v1/chat/completions`.
+Upload a VRM character in Settings; personal models and saved data are ignored by Git.
+
+The backend listens on port 3000. The client probes HTTPS port 3443 first,
+then permits HTTP port 3000 only when the page itself uses HTTP. For remote
+microphone/camera access, serve the frontend over HTTPS and configure a trusted
+HTTPS reverse proxy (such as Caddy) on backend port 3443. No proxy is bundled.
+Failed application requests are never automatically replayed.
+
+Optional: copy `server/assets/system-prompt.example.md` to
+`server/assets/system-prompt.md` for a personal prompt. The example is used when
+no custom prompt exists. Existing custom prompts and saved data are preserved.
+
+Checks: `npm run check`, `npm test`, `npm run lint`, `npm run build`.
+Tests use temporary conversation stores and mocked AI responses, not personal data.
 
 ## Known limitations
 
@@ -74,65 +86,23 @@ rather.
 
 ## How the memory system works
 
-Every time you send a message, three things happen, none of which block
-your reply:
+User facts, including wants, needs, and preferences, stay in the local SQLite
+database until you select **Forget** for a fact in Settings → User memory.
+Deleting a chat removes its searchable summary but keeps its user facts.
+You can add, edit, and pin facts there. An edited fact is protected from later
+automatic extraction; forgetting one also prevents old chats from restoring it.
+Reordered topic names such as `japanese_learning` and `learning_japanese`
+reuse one fact. On startup, duplicate copies with identical text are consolidated;
+their original records, pins, and history are preserved.
 
-1. **Known facts get pulled in.** The app keeps a running list of things
-   it's learned about you and your projects in a small local database.
-   These are added to every conversation automatically.
-2. **Sometimes, it searches past conversations.** If your message sounds
-   like it's referencing something from before ("remember when...", "what
-   did we decide about...") the app searches summaries of past
-   conversations for anything relevant and works it into context. If your
-   message doesn't sound like that, this step is skipped entirely — it
-   isn't running a search on every single message.
-3. **After the reply, memory updates in the background.** A quick,
-   separate step reads the exchange and pulls out anything worth
-   remembering long-term. Every so often — and whenever you switch to a
-   different conversation — older material gets compressed into a summary,
-   which is what step 2 searches through later.
+Recent and pinned facts are included within a fixed prompt budget. When a
+message refers to an earlier chat, SQLite FTS5 searches past summaries.
+A queued background worker combines summary updates and fact extraction in
+one model call per bounded chunk after a chat goes idle or you switch chats. Pending work is
+recovered on restart. Normal recall does not download or load an embedding
+model. Existing vector records are retained for migration safety.
 
-Everything above lives in `server/lib/memory/` — six small files, one per
-responsibility (facts, summaries, retrieval, embeddings, the database, and
-a small orchestration layer that ties them together). See `ai.md` for the
-file-by-file breakdown.
-
-### The concepts, explained
-
-**SQLite** — a full relational database that lives in a single file on
-disk, with no separate database server to install or run. It's a natural
-fit for a local-first app: the whole memory store is just one `.db` file
-you could back up by copying it.
-Read more: https://www.sqlite.org/about.html
-
-**`node:sqlite`** — Node.js has shipped its own built-in SQLite module
-since version 22.13. This app uses it instead of the more common
-`better-sqlite3` package specifically because `better-sqlite3` has to be
-compiled from C++ source on install, which can break on a Windows machine
-without a properly configured build toolchain (which is exactly what
-happened during development). Node's built-in version needs no compilation
-at all.
-Read more: https://nodejs.org/api/sqlite.html
-
-**Embeddings (vectors)** — an embedding is a list of numbers — 384 of them,
-here — that represents the *meaning* of a piece of text, produced by a
-small AI model. Text with similar meaning ends up with similar numbers, so
-"I love hiking" and "trails are my favorite" land close together in that
-number-space even though they don't share a single word. That's what makes
-searching *by meaning* possible, instead of only by exact keyword match.
-Read more: https://www.ibm.com/think/topics/vector-embedding
-
-**`sqlite-vec`** — a SQLite extension that adds the ability to store these
-number-lists and efficiently answer "which of these thousands of vectors
-is closest to this one?" It runs entirely locally as a small C extension —
-no cloud service, no separate vector database to run.
-Read more: https://github.com/asg017/sqlite-vec
-
-**RAG (Retrieval-Augmented Generation)** — the general pattern this memory
-system is one small example of. Rather than a language model relying
-purely on what it "remembers" from training or from the current
-conversation, RAG *retrieves* relevant information from an outside store
-right before generating a reply, and feeds it in as extra context. It's
-the standard way to give an LLM access to information beyond its training
-data or its context window, without retraining it.
-Read more: https://www.ibm.com/think/topics/retrieval-augmented-generation
+The database is `server/data/memory.db`. A versioned backup is created
+before the first schema migration. The implementation lives in
+`server/lib/memory/`; the public entrypoint is `index.js`.
+Run `npm run memory:check` for a read-only integrity and job-status report.

@@ -324,6 +324,24 @@
     cursor: default;
 }
 
+.tools-menu-embedded {
+    width: 100%;
+}
+
+.tools-menu-embedded > .tools-menu-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+}
+
+.tools-menu-list {
+    padding: 4px 0 0 10px;
+}
+
 .tools-menu-error {
     color: var(--error-color);
 }
@@ -336,16 +354,29 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-weight: bold;
     opacity: 0.85;
     padding: 4px 2px;
+    gap: 8px;
+    width: 100%;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-weight: bold;
+    text-align: left;
     cursor: pointer;
     user-select: none;
+}
+
+.tools-menu-group-header > span:first-child {
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .tools-menu-group-count {
     opacity: 0.6;
     font-size: 0.8em;
+    flex-shrink: 0;
 }
 
 .tools-menu-group-items {
@@ -357,6 +388,7 @@
 .tools-menu-item {
     padding: 2px 0;
     opacity: 0.9;
+    overflow-wrap: anywhere;
 }
 
 /* ---------- SettingsPanel ---------- */
@@ -388,6 +420,9 @@
 
 .settings-select {
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     padding: 6px 8px;
     background: var(--bg-input);
     color: var(--text-primary);
@@ -403,6 +438,70 @@
     font-size: 11px;
     color: var(--text-faint);
     margin-top: 4px;
+}
+
+/* ---------- User memory ---------- */
+.memory-panel {
+    min-width: 0;
+    text-align: left;
+}
+
+.memory-panel > summary {
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.memory-panel-content {
+    display: grid;
+    gap: 12px;
+    padding-top: 10px;
+}
+
+.memory-panel-content > p {
+    margin: 0;
+}
+
+.memory-form {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+.memory-field {
+    display: block;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.memory-value {
+    display: block;
+    resize: vertical;
+    font: inherit;
+    line-height: 1.4;
+}
+
+.memory-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.memory-actions > button {
+    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-input);
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.memory-pin {
+    margin-right: auto;
 }
 
 .settings-checkbox-row {
@@ -460,7 +559,15 @@
     text-align: right;
 }
 
+.settings-field {
+    display: block;
+    margin-top: 8px;
+}
+
 .settings-dropzone {
+    width: 100%;
+    background: transparent;
+    font: inherit;
     border: 2px dashed var(--border-strong);
     border-radius: 6px;
     padding: 20px;
@@ -478,6 +585,7 @@
 /* ---------- ConversationList ---------- */
 .conversation-list {
     display: flex;
+    flex-shrink: 0;
     gap: 6px;
     align-items: center;
     font-size: 12px;
@@ -597,15 +705,27 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
     padding: 8px 10px;
     background: var(--bg-input);
     border: 1px solid var(--border-color);
     border-radius: 4px;
 }
 
+.provider-summary-details {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.provider-summary > button {
+    flex-shrink: 0;
+}
+
 .provider-edit {
     display: flex;
     flex-direction: column;
+    min-width: 0;
 }
 
 .settings-model-row {
@@ -675,10 +795,84 @@
 }
 
 
+/* .window-header-extra already exists above with base flex rules — this
+   adds min-width: 0 (same selector, later in the cascade wins for this
+   property), which is what actually lets it shrink below its content's
+   natural width instead of just silently overflowing the window. Without
+   this, OverflowIconBar never gets a meaningful "available width" to
+   measure against. */
 .window-header-extra {
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+
+/* ---------- OverflowIconBar ---------- */
+.overflow-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+}
+
+.overflow-bar-item {
+    flex-shrink: 0;
+    display: inline-flex;
+    cursor: grab;
+}
+
+.overflow-bar-item:active {
+    cursor: grabbing;
+}
+
+.overflow-bar-menu {
+    position: relative;
+    flex-shrink: 0;
+}
+
+.overflow-bar-chevron {
+    flex-shrink: 0;
+}
+
+.overflow-bar-dropdown {
+    min-width: 160px;
+}
+
+.overflow-bar-dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    cursor: grab;
+    border-radius: 4px;
+}
+
+.overflow-bar-dropdown-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.overflow-bar-dropdown-item:active {
+    cursor: grabbing;
+}
+
+.overflow-bar-dropdown-icon {
+    display: inline-flex;
+    width: 100%;
+    min-width: 0;
+}
+
+.overflow-bar-measure {
+    position: absolute;
+    top: -9999px;
+    left: -9999px;
+    display: flex;
+    gap: 6px;
+    visibility: hidden;
+    pointer-events: none;
+    white-space: nowrap;
 }
 
 .anki-window-status {

@@ -38,3 +38,17 @@ server/certs
 client/README.ai.md
 server/assets/system-prompt.md
 LICENSE
+
+# Generated source bundle
+/combined_files.txt
+AGENT_CAPABILITIES_PLAN.md
+MEMORY_SYSTEM_PLAN.md
+REVIEW_PLAN.md
+scripts/benchmark-memory.js
+client/tests/ui.test.mjs
+tests/chat.test.cjs
+tests/client-utils.test.mjs
+tests/conversations.test.cjs
+tests/memory-dedup.test.cjs
+tests/memory.test.cjs
+tests/tool-loop.test.cjs

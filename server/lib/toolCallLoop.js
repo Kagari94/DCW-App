@@ -2,6 +2,7 @@
 // server/lib/toolCallLoop.js — model-agnostic tool-calling round-trip loop
 // ============================================
 const axios = require('axios');
+const { runToolLoop } = require('./toolLoop');
 const { getToolDefinitions, getToolHandlers } = require('../tools');
 const { buildExpandedMessages } = require('./attachmentProcessor.js');
 const { defaultHttpAgent, getHttpsAgent } = require('./httpAgents.js');
@@ -199,71 +200,10 @@ async function callModel(messages, config, onContentDelta) {
 //   { message, uiEvents }                          — normal completion
 //   { needsScreenFrame: { toolCallId }, uiEvents }  — paused, waiting on
 //                                                      the client (see below)
-async function runWithTools(messages, config, onContentDelta) {
-    const toolHandlers = getToolHandlers();
-    const uiEvents = [];
-
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
-        const message = await callModel(messages, config, onContentDelta);
-        const toolCalls = message.tool_calls;
-
-        if (!toolCalls || toolCalls.length === 0) {
-            return { message, uiEvents };
-        }
-
-        messages.push(message);
-
-        for (const call of toolCalls) {
-            const handler = toolHandlers[call.function.name];
-            let result;
-
-            if (!handler) {
-                result = { error: `Unknown tool: ${call.function.name}` };
-            } else {
-                try {
-                    const args = JSON.parse(call.function.arguments || '{}');
-                    result = await handler(args, config);
-                } catch (err) {
-                    console.error(`Tool "${call.function.name}" failed:`, err);
-                    result = { error: err.message };
-                }
-            }
-
-            if (result && result.ui) uiEvents.push(result.ui);
-
-            if (result && result.__viewImage) {
-                const img = result.__viewImage;
-                messages.push({
-                    role: 'tool',
-                    tool_call_id: call.id,
-                    content: JSON.stringify({ ok: true, note: `Image "${img.filename}" loaded — see below.` }),
-                });
-                messages.push({
-                    role: 'user',
-                    content: `[Viewing image: ${img.filename}]`,
-                    attachments: [{
-                        path: img.absolutePath,
-                        filename: img.filename,
-                        storedFilename: img.filename,
-                        size: img.size,
-                    }],
-                });
-                continue;
-            }
-
-            if (result && result.__needScreenFrame) {
-                return { needsScreenFrame: { toolCallId: call.id }, uiEvents };
-            }
-
-            messages.push({
-                role: 'tool',
-                tool_call_id: call.id,
-                content: JSON.stringify(result),
-            });
-        }
-    }
-
-    throw new Error(`Tool call loop exceeded ${MAX_ITERATIONS} iterations without a final reply`);
+function runWithTools(messages, config, onContentDelta) {
+    return runToolLoop(messages, config, onContentDelta, {
+        callModel, toolHandlers: getToolHandlers(), maxIterations: MAX_ITERATIONS,
+    });
 }
 
 module.exports = { runWithTools };

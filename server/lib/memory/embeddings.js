@@ -1,7 +1,7 @@
 // ============================================
 // server/lib/memory/embeddings.js — local embedding model
 // ============================================
-const { EMBEDDING_DIM } = require('./db.js');
+const EMBEDDING_DIM = 384;
 
 let pipelinePromise = null;
 

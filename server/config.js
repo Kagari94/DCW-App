@@ -6,5 +6,5 @@ module.exports = {
     PI_APP_TOKEN: '',  // must match APP_TOKEN in the Pi service's own .env
     MAX_REQUEST_LENGTH: 2000,
     DEBUG: true,
-    KOKORO_VOICES_DIR: require('path').join(__dirname, 'node_modules', 'kokoro-js', 'voices'),
+    KOKORO_VOICES_DIR: require('path').join(__dirname, '..', 'node_modules', 'kokoro-js', 'voices'),
 };

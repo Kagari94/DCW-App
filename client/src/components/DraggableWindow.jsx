@@ -1,9 +1,22 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
+import { getPref, setPref } from '../utils/localPrefs';
 
-function DraggableWindow({ title, headerExtra, children, initialX = 40, initialY = 40, width = 380 }) {
+// `persistKey` (falls back to `title`) is the localStorage key this
+// window's position + collapsed state is remembered under — restored on
+// mount, saved on every change. Each window's titles here ("Chat",
+// "Weather", "Flashcard Review", "Settings") are already stable strings,
+// so the default is normally enough; pass persistKey explicitly only if
+// two windows might ever share a title.
+function DraggableWindow({ title, persistKey, headerExtra, children, initialX = 40, initialY = 40, width = 380 }) {
+    const storageKey = `window:${persistKey || title}`;
+    const [saved] = useState(() => getPref(storageKey, null));
+
     const containerRef = useRef(null);
-    const [position, setPosition] = useState({ x: initialX, y: initialY });
-    const [collapsed, setCollapsed] = useState(false);
+    const [position, setPosition] = useState(() => ({
+        x: saved?.x ?? initialX,
+        y: saved?.y ?? initialY,
+    }));
+    const [collapsed, setCollapsed] = useState(saved?.collapsed ?? false);
     const draggingRef = useRef(false);
     const offsetRef = useRef({ x: 0, y: 0 });
 
@@ -20,37 +33,41 @@ function DraggableWindow({ title, headerExtra, children, initialX = 40, initialY
     }, [width]);
 
     useEffect(() => {
-        setPosition(prev => clampPosition(prev));
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    useEffect(() => {
+        function handleMouseMove(e) {
+            if (!draggingRef.current) return;
+            setPosition(clampPosition({
+                x: e.clientX - offsetRef.current.x,
+                y: e.clientY - offsetRef.current.y,
+            }));
+        }
+        function handleMouseUp() {
+            draggingRef.current = false;
+        }
         function handleResize() {
             setPosition(prev => clampPosition(prev));
         }
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
         window.addEventListener('resize', handleResize);
-        return () => window.removeEventListener('resize', handleResize);
+        const frame = window.requestAnimationFrame(handleResize);
+        return () => {
+            window.cancelAnimationFrame(frame);
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+            window.removeEventListener('resize', handleResize);
+        };
     }, [clampPosition]);
+
+    // Persist position + collapsed state on every change.
+    useEffect(() => {
+        setPref(storageKey, { x: position.x, y: position.y, collapsed });
+    }, [storageKey, position.x, position.y, collapsed]);
 
     const handleMouseDown = useCallback((e) => {
         if (e.target.closest('.window-toggle') || e.target.closest('.window-header-extra')) return;
         draggingRef.current = true;
         offsetRef.current = { x: e.clientX - position.x, y: e.clientY - position.y };
-        window.addEventListener('mousemove', handleMouseMove);
-        window.addEventListener('mouseup', handleMouseUp);
     }, [position]);
-
-    const handleMouseMove = useCallback((e) => {
-        if (!draggingRef.current) return;
-        const raw = { x: e.clientX - offsetRef.current.x, y: e.clientY - offsetRef.current.y };
-        setPosition(clampPosition(raw));
-    }, [clampPosition]);
-
-    const handleMouseUp = useCallback(() => {
-        draggingRef.current = false;
-        window.removeEventListener('mousemove', handleMouseMove);
-        window.removeEventListener('mouseup', handleMouseUp);
-    }, [handleMouseMove]);
 
     return (
         <div

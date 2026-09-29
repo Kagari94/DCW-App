@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import useLatestCallback from '../hooks/useLatestCallback';
+import { blobToWav16kMono } from '../utils/audioCapture';
+import { useState, useEffect, useRef } from 'react';
 import { authHeaders } from '../utils/authToken';
 import { apiFetch } from '../apiConfig';
 
@@ -35,7 +37,6 @@ export default function AnkiWindow({ onDiscussCard }) {
     useEffect(() => {
         loadDueCards();
         return () => stopVoiceLoop();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     async function loadDueCards() {
@@ -95,7 +96,7 @@ export default function AnkiWindow({ onDiscussCard }) {
     // cadence as ChatBox's wake-word polling — but no wake word needed;
     // the FIRST non-empty transcript while a card is showing and nothing
     // is currently being graded is treated as that card's answer. ----
-    const recordOneChunk = useCallback(function recordOneChunk() {
+    const recordOneChunk = useLatestCallback(() => {
         const stream = streamRef.current;
         if (!voiceModeRef.current || !stream) return;
 
@@ -115,7 +116,6 @@ export default function AnkiWindow({ onDiscussCard }) {
 
             setMicStatus('transcribing');
             try {
-                const { blobToWav16kMono } = await import('../utils/audioCapture.js');
                 const wavBlob = await blobToWav16kMono(new Blob(chunks));
                 const formData = new FormData();
                 formData.append('audio', wavBlob, 'clip.wav');
@@ -141,8 +141,7 @@ export default function AnkiWindow({ onDiscussCard }) {
         setTimeout(() => {
             if (recorder.state === 'recording') recorder.stop();
         }, VOICE_CHUNK_MS);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    });
 
     async function startVoiceLoop() {
         try {

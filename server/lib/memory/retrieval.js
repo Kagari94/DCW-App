@@ -1,54 +1,28 @@
-// ============================================
-// server/lib/memory/retrieval.js — heuristic-gated vector search over past conversations
-// ============================================
-const { getDb, toVecBuffer } = require('./db.js');
-const { embedText } = require('./embeddings.js');
+const { getDb } = require('./db.js');
 
-const TOP_K = 3;
+const RETRIEVAL_TRIGGERS = /\b(remember|recall|earlier|before|previously|last time|again|discussed|talked|mentioned|you said|we decide|we decided|muistatko|muista|aiemmin|ennen|viimeksi|puhuimme|kerroit|sanoit|sovimme)\b/iu;
+const STOP = new Set(['remember', 'recall', 'earlier', 'before', 'previously', 'last', 'time', 'again', 'we', 'you', 'the', 'and', 'did', 'what', 'about', 'said', 'decide', 'decided', 'muistatko', 'muista', 'aiemmin', 'ennen', 'viimeksi', 'me', 'sinä', 'ja', 'mikä', 'mitä', 'sanoit', 'sovimme']);
 
-// First-guess heuristic (same spirit as ChatBox.jsx's SCREEN_KEYWORDS) —
-// only bother embedding + searching when the message actually seems to
-// reference something outside the current conversation. Expect to tune
-// based on false positives/negatives in practice.
-const RETRIEVAL_TRIGGERS = /\b(remember|recall|last time|earlier|before|previously|we (talked|discussed|worked on)|you (said|mentioned|told me)|again)\b/i;
+function shouldRetrieve(text) { return RETRIEVAL_TRIGGERS.test(text || ''); }
 
-function shouldRetrieve(userText) {
-    return RETRIEVAL_TRIGGERS.test(userText);
+function queryTerms(text) {
+    return [...new Set(((text || '').match(/[\p{L}\p{N}]{3,}/gu) || [])
+        .map(term => term.toLowerCase()).filter(term => !STOP.has(term)))].slice(0, 12);
 }
 
-// Two-step query (vector search, then resolve rowids against memory_chunks)
-// rather than a single JOIN — sqlite-vec is pre-v1 and its join behavior
-// with regular tables isn't something to lean on yet; this is the safer,
-// documented pattern.
-async function retrieveRelevantChunks(userText, currentConversationId) {
-    const db = getDb();
-    const queryVector = await embedText(userText);
-
-    const matches = db.prepare(`
-        SELECT rowid, distance
-        FROM memory_vectors
-        WHERE embedding MATCH ?
-        ORDER BY distance
-        LIMIT ?
-    `).all(toVecBuffer(queryVector), TOP_K);
-
-    if (matches.length === 0) return [];
-
-    const placeholders = matches.map(() => '?').join(',');
-    const chunkRows = db.prepare(`
-        SELECT id, conversation_id, chunk_text
-        FROM memory_chunks
-        WHERE id IN (${placeholders})
-    `).all(...matches.map(m => m.rowid));
-
-    const distanceById = new Map(matches.map(m => [m.rowid, m.distance]));
-
-    // Skip chunks from the conversation currently in progress — that
-    // content is already live in context, re-injecting it is just noise.
-    return chunkRows
-        .filter(r => r.conversation_id !== currentConversationId)
-        .map(r => ({ ...r, distance: distanceById.get(r.id) }))
-        .sort((a, b) => a.distance - b.distance);
+async function retrieveRelevantChunks(text, currentConversationId) {
+    const terms = queryTerms(text);
+    if (!terms.length) return [];
+    // A short prefix also catches common Finnish inflections without a model.
+    const query = terms.map(term => term.length >= 7 ?
+        `"${term.slice(0, -3)}"*` : `"${term}"`).join(' OR ');
+    return getDb().prepare(`SELECT s.conversation_id, s.final_summary AS chunk_text,
+        bm25(summary_fts) AS score FROM summary_fts
+        JOIN conversation_summaries s ON s.rowid = summary_fts.rowid
+        WHERE summary_fts MATCH ? AND s.conversation_id != ? AND s.final_summary IS NOT NULL
+        ORDER BY score LIMIT 3`).all(query, currentConversationId || '').map(row => ({
+        ...row, chunk_text: row.chunk_text.slice(0, 1200),
+    }));
 }
 
-module.exports = { shouldRetrieve, retrieveRelevantChunks };
+module.exports = { shouldRetrieve, queryTerms, retrieveRelevantChunks };

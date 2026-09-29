@@ -13,7 +13,23 @@ export default function useVoiceInput(settings, onCommand) {
     const [awaitingCommand, setAwaitingCommand] = useState(false);
     const mediaRecorderRef = useRef(null);
     const streamRef = useRef(null);
+    const mountedRef = useRef(false);
+    const pushRequestedRef = useRef(false);
     const wakeWordActiveRef = useRef(false);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            pushRequestedRef.current = false;
+            const recorder = mediaRecorderRef.current;
+            if (recorder) {
+                recorder.onstop = null;
+                if (recorder.state === 'recording') recorder.stop();
+            }
+            streamRef.current?.getTracks().forEach(track => track.stop());
+        };
+    }, []);
 
     const voiceConfig = settings?.voiceInput;
 
@@ -34,17 +50,24 @@ export default function useVoiceInput(settings, onCommand) {
     }, []);
 
     const startPushToTalk = useCallback(async () => {
-        if (mediaRecorderRef.current) return;
+        if (mediaRecorderRef.current || pushRequestedRef.current) return;
+        pushRequestedRef.current = true;
 
         let stream;
         try {
             stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         } catch (err) {
+            pushRequestedRef.current = false;
+            if (!mountedRef.current) return;
             console.error('Microphone access denied or unavailable:', err);
             alert('⚠️ Could not access microphone. Check browser permissions.');
             return;
         }
 
+        if (!mountedRef.current || !pushRequestedRef.current) {
+            stream.getTracks().forEach(track => track.stop());
+            return;
+        }
         streamRef.current = stream;
         const recorder = new MediaRecorder(stream);
         const chunks = [];
@@ -55,11 +78,11 @@ export default function useVoiceInput(settings, onCommand) {
             mediaRecorderRef.current = null;
             setIsListening(false);
 
-            if (chunks.length === 0) return;
+            if (!mountedRef.current || chunks.length === 0) return;
             setIsTranscribing(true);
             try {
                 const text = await transcribeBlob(new Blob(chunks));
-                if (text) onCommand(text, 'push-to-talk');
+                if (mountedRef.current && text) onCommand(text, 'push-to-talk');
             } catch (err) {
                 console.error('Voice transcription failed:', err);
                 alert(`⚠️ Transcription failed: ${err.message}`);
@@ -73,6 +96,7 @@ export default function useVoiceInput(settings, onCommand) {
     }, [onCommand, transcribeBlob]);
 
     const stopPushToTalk = useCallback(() => {
+        pushRequestedRef.current = false;
         if (mediaRecorderRef.current?.state === 'recording') {
             mediaRecorderRef.current.stop();
         }
@@ -85,8 +109,6 @@ export default function useVoiceInput(settings, onCommand) {
         let stream = null;
         let recorder = null;
         wakeWordActiveRef.current = false;
-        setAwaitingCommand(false);
-
         const CHUNK_MS = 4000;
         const commandModel = voiceConfig.whisperModel || DEFAULT_COMMAND_MODEL;
         const pollModel = voiceConfig.wakeWordPollModel || DEFAULT_POLL_MODEL;
@@ -156,6 +178,7 @@ export default function useVoiceInput(settings, onCommand) {
             }
             streamRef.current = stream;
             setIsListening(true);
+            setAwaitingCommand(false);
             recordOneChunk();
         }
 

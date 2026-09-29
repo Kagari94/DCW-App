@@ -1,83 +1,161 @@
-// ============================================
-// server/lib/memory/db.js — SQLite store for facts, summaries, vector chunks
-// ============================================
-const path = require('path');
-const fs = require('fs');
-const { DatabaseSync } = require('node:sqlite');
-const sqliteVec = require('sqlite-vec');
+const fs = require('node:fs');
+const path = require('node:path');
+const { DatabaseSync, backup } = require('node:sqlite');
+const { consolidateDuplicateFacts } = require('./factIdentity.js');
 
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
-const DB_PATH = path.join(DATA_DIR, 'memory.db');
+const DB_PATH = process.env.COMPANION_MEMORY_DB_PATH || path.join(__dirname, '../../data/memory.db');
+const SCHEMA_VERSION = 4;
+let db;
+let opening;
+let legacyVectorsLoaded = false;
 
-const EMBEDDING_DIM = 384; // output size of Xenova/all-MiniLM-L6-v2
+function tableExists(name) {
+    return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(name));
+}
 
-let db = null;
+function loadLegacyVectors() {
+    if (!legacyVectorsLoaded && tableExists('memory_vectors')) {
+        require('sqlite-vec').load(db);
+        legacyVectorsLoaded = true;
+    }
+}
+
+async function initializeMemoryDatabase() {
+    if (db) return db;
+    if (opening) return opening;
+    opening = (async () => {
+        fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+        const existed = fs.existsSync(DB_PATH);
+        const connection = new DatabaseSync(DB_PATH, { allowExtension: true });
+        db = connection;
+        try {
+            const version = connection.prepare('PRAGMA user_version').get().user_version;
+            if (version > SCHEMA_VERSION) throw new Error(`Memory database version ${version} is newer than this app`);
+            if (version < SCHEMA_VERSION && existed) {
+                const copy = `${DB_PATH}.pre-v${SCHEMA_VERSION}-${Date.now()}.bak`;
+                await backup(connection, copy);
+                console.log(`Memory backup created: ${copy}`);
+            }
+            const priorFacts = tableExists('facts') ?
+                connection.prepare('SELECT count(*) AS n FROM facts').get().n : 0;
+            const priorSummaries = tableExists('conversation_summaries') ?
+                connection.prepare('SELECT count(*) AS n FROM conversation_summaries').get().n : 0;
+            connection.exec('BEGIN IMMEDIATE');
+            try {
+                connection.exec(`
+                    CREATE TABLE IF NOT EXISTS facts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        category TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                        source_conversation_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                        UNIQUE(category, key)
+                    );
+                    CREATE TABLE IF NOT EXISTS fact_revisions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        fact_id INTEGER NOT NULL, value TEXT NOT NULL,
+                        source_conversation_id TEXT, changed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS forgotten_facts (
+                        category TEXT NOT NULL, key TEXT NOT NULL,
+                        forgotten_at TEXT NOT NULL, PRIMARY KEY (category, key)
+                    );
+                    CREATE TABLE IF NOT EXISTS fact_aliases (
+                        category TEXT NOT NULL, key TEXT NOT NULL, fact_id INTEGER NOT NULL,
+                        PRIMARY KEY (category, key)
+                    );
+                    CREATE INDEX IF NOT EXISTS fact_aliases_fact ON fact_aliases(fact_id);
+                    CREATE TABLE IF NOT EXISTS fact_merge_archive (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        fact_id INTEGER NOT NULL, original_fact TEXT NOT NULL, merged_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY, rolling_summary TEXT, final_summary TEXT,
+                        message_count_at_last_summary INTEGER NOT NULL DEFAULT 0,
+                        message_offset_at_last_summary INTEGER NOT NULL DEFAULT 0,
+                        finalized INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS memory_jobs (
+                        conversation_id TEXT PRIMARY KEY, target_count INTEGER NOT NULL,
+                        finalize_requested INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                        next_run_at INTEGER NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT
+                    );
+                `);
+                const factColumns = connection.prepare('PRAGMA table_info(facts)').all().map(column => column.name);
+                if (!factColumns.includes('pinned')) connection.exec('ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+                if (!factColumns.includes('source_kind')) connection.exec("ALTER TABLE facts ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'automatic'");
+                const summaryColumns = connection.prepare('PRAGMA table_info(conversation_summaries)').all().map(column => column.name);
+                if (!summaryColumns.includes('message_offset_at_last_summary')) {
+                    connection.exec('ALTER TABLE conversation_summaries ADD COLUMN message_offset_at_last_summary INTEGER NOT NULL DEFAULT 0');
+                }
+                if (!tableExists('summary_fts')) {
+                    connection.exec(`
+                        CREATE VIRTUAL TABLE summary_fts USING fts5(
+                            final_summary, content='conversation_summaries', content_rowid='rowid'
+                        );
+                        CREATE TRIGGER summary_fts_ai AFTER INSERT ON conversation_summaries BEGIN
+                            INSERT INTO summary_fts(rowid, final_summary) VALUES (new.rowid, new.final_summary);
+                        END;
+                        CREATE TRIGGER summary_fts_ad AFTER DELETE ON conversation_summaries BEGIN
+                            INSERT INTO summary_fts(summary_fts, rowid, final_summary)
+                            VALUES ('delete', old.rowid, old.final_summary);
+                        END;
+                        CREATE TRIGGER summary_fts_au AFTER UPDATE OF final_summary ON conversation_summaries BEGIN
+                            INSERT INTO summary_fts(summary_fts, rowid, final_summary)
+                            VALUES ('delete', old.rowid, old.final_summary);
+                            INSERT INTO summary_fts(rowid, final_summary) VALUES (new.rowid, new.final_summary);
+                        END;
+                        INSERT INTO summary_fts(summary_fts) VALUES ('rebuild');
+                    `);
+                }
+                if (connection.prepare('SELECT count(*) AS n FROM facts').get().n !== priorFacts ||
+                    connection.prepare('SELECT count(*) AS n FROM conversation_summaries').get().n !== priorSummaries) {
+                    throw new Error('Memory migration changed existing row counts');
+                }
+                if (version < 4) {
+                    const merged = consolidateDuplicateFacts(connection);
+                    if (connection.prepare('SELECT count(*) AS n FROM facts').get().n + merged !== priorFacts) {
+                        throw new Error('Memory consolidation changed unexpected row counts');
+                    }
+                    if (merged) console.log(`Merged ${merged} duplicate memory facts; originals retained`);
+                }
+                connection.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+                connection.exec('COMMIT');
+            } catch (error) { connection.exec('ROLLBACK'); throw error; }
+            return connection;
+        } catch (error) {
+            connection.close();
+            db = undefined;
+            throw error;
+        }
+    })();
+    try { return await opening; }
+    finally { opening = undefined; }
+}
 
 function getDb() {
-    if (db) return db;
-
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-    // node:sqlite — built into Node itself (stable since 22.13, you're on
-    // 24.10.0) — instead of better-sqlite3. better-sqlite3's node-gyp build
-    // was failing on this machine's VS Build Tools config, and it isn't
-    // needed: node:sqlite's synchronous API is close enough for our needs,
-    // with zero native compilation. allowExtension:true is required at
-    // construction time — sqlite-vec's load() needs to enable extension
-    // loading internally, and it can't if this wasn't set up front.
-    db = new DatabaseSync(DB_PATH, { allowExtension: true });
-    sqliteVec.load(db); // registers vec0 virtual-table support on this connection
-
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            source_conversation_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(category, key)
-        );
-
-        CREATE TABLE IF NOT EXISTS conversation_summaries (
-            conversation_id TEXT PRIMARY KEY,
-            rolling_summary TEXT,
-            final_summary TEXT,
-            message_count_at_last_summary INTEGER NOT NULL DEFAULT 0,
-            finalized INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS memory_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            chunk_text TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-    `);
-
-    // vec0 virtual table — rowid is set explicitly to match memory_chunks.id
-    // on insert, so a vector hit maps straight back to its source row with
-    // no join table needed. Kept as a SEPARATE table (not columns bolted
-    // onto memory_chunks) because vec0 is pre-v1 and its join behavior with
-    // regular tables isn't reliable yet — safer to query it standalone and
-    // resolve rowids against memory_chunks in a second step.
-    db.exec(`
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(
-            embedding float[${EMBEDDING_DIM}]
-        );
-    `);
-
+    if (!db) throw new Error('Memory database has not been initialized');
     return db;
 }
 
-// Vector params need to go in as raw bytes, not a bare Float32Array —
-// node:sqlite's binding layer expects a Buffer for BLOB params (unlike
-// better-sqlite3, which accepts a TypedArray directly). Shared here so
-// summaries.js and retrieval.js stay consistent.
-function toVecBuffer(vector) {
-    return Buffer.from(new Float32Array(vector).buffer);
+function deleteConversationMemory(conversationId) {
+    const connection = getDb();
+    loadLegacyVectors();
+    connection.exec('BEGIN IMMEDIATE');
+    try {
+        connection.prepare('DELETE FROM memory_jobs WHERE conversation_id = ?').run(conversationId);
+        connection.prepare('DELETE FROM conversation_summaries WHERE conversation_id = ?').run(conversationId);
+        if (tableExists('memory_chunks')) {
+            const ids = connection.prepare('SELECT id FROM memory_chunks WHERE conversation_id = ?').all(conversationId);
+            if (legacyVectorsLoaded) {
+                const removeVector = connection.prepare('DELETE FROM memory_vectors WHERE rowid = ?');
+                for (const { id } of ids) removeVector.run(id);
+            }
+            connection.prepare('DELETE FROM memory_chunks WHERE conversation_id = ?').run(conversationId);
+        }
+        // User profile facts intentionally survive conversation deletion.
+        connection.exec('COMMIT');
+    } catch (error) { connection.exec('ROLLBACK'); throw error; }
 }
 
-module.exports = { getDb, EMBEDDING_DIM, toVecBuffer };
+module.exports = { initializeMemoryDatabase, getDb, deleteConversationMemory, DB_PATH };

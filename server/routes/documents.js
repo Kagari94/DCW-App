@@ -5,14 +5,19 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
+const { validateConversationId } = require('../conversations');
 const router = express.Router();
+router.param('conversationId', (req, res, next, id) => {
+    try { validateConversationId(id); next(); }
+    catch (error) { res.status(400).json({ error: error.message }); }
+});
 const GENERATED_ROOT = path.join(__dirname, '../data/generated');
 
 router.get('/conversations/:conversationId/documents/:storedFilename', (req, res) => {
     const conversationDir = path.resolve(path.join(GENERATED_ROOT, req.params.conversationId));
     const filePath = path.resolve(path.join(conversationDir, req.params.storedFilename));
 
-    if (!filePath.startsWith(conversationDir)) {
+    if (!filePath.startsWith(conversationDir + path.sep)) {
         return res.status(400).json({ error: 'Invalid path.' });
     }
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Document not found.' });

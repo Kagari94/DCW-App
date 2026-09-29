@@ -3,6 +3,7 @@
 // ============================================
 const path = require('path');
 const express = require('express');
+const { initializeMemoryDatabase } = require('./lib/memory/db.js');
 const cors = require('cors');
 const { initTools, getToolHandlers } = require('./tools');
 const { startHeartbeats } = require('./lib/heartbeat/registry.js');
@@ -27,8 +28,9 @@ app.use('/api', requireAuth);
 app.get('/health', (req, res) => {
     res.json({ status: 'ok' });
 });
-const chatRoutes = require('./routes/chat');
+const chatRoutes = require('./routes/chat').makeRouter();
 app.use('/api', chatRoutes);
+app.use('/api', require('./routes/memory.js'));
 
 app.use('/api', require('./routes/tools.js'));
 
@@ -49,6 +51,8 @@ const { watchForChanges } = require('./scripts/syncExpressions');
 watchForChanges();
 
 (async () => {
+    await initializeMemoryDatabase();
+    require('./lib/memory').startMemoryWorker();
     await initTools();
     startHeartbeats(heartbeatChecks, { getToolHandlers, broadcast });
 

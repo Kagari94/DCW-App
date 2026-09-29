@@ -1,4 +1,18 @@
 {
+  "private": true,
+  "scripts": {
+    "start": "node server/index.js",
+    "dev:client": "npm run dev --prefix client",
+    "check": "node scripts/check-server.js",
+    "memory:check": "node scripts/check-memory.js",
+    "memory:benchmark": "node scripts/benchmark-memory.js",
+    "test": "node --test tests/*.test.cjs tests/*.test.mjs client/tests/*.test.mjs",
+    "lint": "npm run lint --prefix client",
+    "build": "npm run build --prefix client"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.30.0",

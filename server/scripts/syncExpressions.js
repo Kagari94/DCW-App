@@ -67,6 +67,7 @@ function syncPrompt() {
         return;
     }
 
+    if (!fs.existsSync(PROMPT_PATH)) return;
     const expressionNames = readVrmExpressionNames(vrmPath);
 
     let promptText = fs.readFileSync(PROMPT_PATH, 'utf8');
@@ -82,7 +83,8 @@ function syncPrompt() {
 }
 
 function watchForChanges() {
-    syncPrompt(); // run once immediately on startup
+    fs.mkdirSync(MODELS_DIR, { recursive: true });
+    syncPrompt();
 
     fs.watch(MODELS_DIR, (eventType, filename) => {
         if (filename === VRM_FILENAME) {

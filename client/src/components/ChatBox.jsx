@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react';
+import { useState, useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { authHeaders } from '../utils/authToken';
 import { apiFetch } from '../apiConfig';
-import { cleanTextForDisplay, getSafeDisplayPrefix } from '../utils/textParsing';
+import useChatSession from '../hooks/useChatSession';
+import useLatestCallback from '../hooks/useLatestCallback';
 import useVoiceInput from '../hooks/useVoiceInput';
 
 const markdownComponents = {
@@ -92,288 +93,30 @@ function AttachmentPreview({ conversationId, attachment }) {
     return <div className="attachment-chip">📄 {attachment.filename}</div>;
 }
 
-// Reads one NDJSON response stream and dispatches each event as it arrives.
-// Returns/stops as soon as the stream reaches a terminal event ('done',
-// 'need_screen_frame', or 'error') — 'need_screen_frame' isn't actually
-// terminal for the overall exchange, just for THIS stream: the caller's
-// onNeedScreenFrame is expected to capture a frame, hit /chat/continue,
-// and call this function again on the new response to keep going. That
-// recursion lives in sendMessage, not here — this function only knows how
-// to drain one stream.
-async function consumeNdjsonStream(res, { onDelta, onDone, onNeedScreenFrame }) {
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            const event = JSON.parse(line);
-
-            if (event.type === 'delta') {
-                onDelta(event.content);
-            } else if (event.type === 'done') {
-                onDone(event);
-                return;
-            } else if (event.type === 'need_screen_frame') {
-                await onNeedScreenFrame(event);
-                return;
-            } else if (event.type === 'error') {
-                throw new Error(event.error);
-            }
-        }
-    }
-
-    throw new Error('Stream ended without a final response.');
-}
-
 const ChatBox = forwardRef(function ChatBox({
     conversationId, settings, onReplyChunk, onUiEvents, onConversationUpdated,
-    screenSessionActive, onGrabScreenFrame, onStopScreenSession, onUserActivity }, ref) {
-    const [messages, setMessages] = useState([]);
-    const [input, setInput] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [pendingAttachments, setPendingAttachments] = useState([]);
-    const [uploading, setUploading] = useState(false);
+    screenSessionActive, onGrabScreenFrame, onUserActivity }, ref) {
+    const { messages, input, setInput, loading, pendingAttachments, uploading, sendMessage,
+        handleFileSelect, removePendingAttachment, loadError, loadingConversation, screenFrame, retryScreenFrame } = useChatSession({
+        conversationId, onReplyChunk, onUiEvents, onConversationUpdated,
+        screenSessionActive, onGrabScreenFrame, onUserActivity,
+    });
     const chatLogRef = useRef(null);
     const fileInputRef = useRef(null);
-
-    const handleVoiceCommandRef = useRef();
-    handleVoiceCommandRef.current = function handleVoiceCommand(text, source) {
-        if (source === 'wake-word') {
-            sendMessage(text);
-        } else {
-            setInput(prev => (prev ? `${prev} ${text}` : text));
-        }
-    };
-    const stableOnCommand = useCallback((text, source) => {
-        handleVoiceCommandRef.current(text, source);
-    }, []);
-
-    const {
-        isListening: isVoiceListening,
-        isTranscribing: isVoiceTranscribing,
-        awaitingCommand,
-        startPushToTalk,
-        stopPushToTalk,
-        pushToTalkAvailable,
-    } = useVoiceInput(settings, stableOnCommand);
-
+    const handleVoiceCommand = useLatestCallback((text, source) => {
+        if (source === 'wake-word') sendMessage(text);
+        else setInput(previous => previous ? `${previous} ${text}` : text);
+    });
+    const { isListening: isVoiceListening, isTranscribing: isVoiceTranscribing, awaitingCommand,
+        startPushToTalk, stopPushToTalk, pushToTalkAvailable } = useVoiceInput(settings, handleVoiceCommand);
     const voiceConfig = settings?.voiceInput;
     const wakeWordModeActive = Boolean(voiceConfig?.enabled && voiceConfig.mode === 'wake-word');
-
     useEffect(() => {
-        if (conversationId) loadConversation();
-    }, [conversationId]);
-
-    useEffect(() => {
-        if (chatLogRef.current) {
-            chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
-        }
+        if (chatLogRef.current) chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
     }, [messages]);
 
-    async function loadConversation() {
-        const res = await apiFetch(`/api/conversations/${conversationId}`, { headers: authHeaders() });
-        if (!res.ok) return;
-        const data = await res.json();
-        const displayMessages = data.messages
-            .filter(m => m.role !== 'system' && m.role !== 'tool' && m.content !== null)
-            .map(m => ({
-                sender: m.role === 'user' ? 'You' : 'AI',
-                text: m.role === 'assistant' ? cleanTextForDisplay(m.content) : m.content,
-                attachments: m.attachments || [],
-                generatedFiles: m.generatedFiles || [],
-            }));
-        setMessages(displayMessages);
-    }
-
-    async function uploadAttachment(file) {
-        if (!file || !conversationId) return null;
-
-        const formData = new FormData();
-        formData.append('file', file);
-
-        const res = await apiFetch(
-            `/api/conversations/${conversationId}/attachments`,
-            {
-                method: 'POST',
-                headers: authHeaders(),
-                body: formData,
-            }
-        );
-
-        const data = await res.json();
-
-        if (!res.ok) {
-            throw new Error(data.error || 'Upload failed');
-        }
-
-        return data;
-    }
-
-    async function handleFileSelect(e) {
-        const files = Array.from(e.target.files || []);
-        e.target.value = '';
-        if (files.length === 0 || !conversationId) return;
-
-        setUploading(true);
-        try {
-            for (const file of files) {
-                const data = await uploadAttachment(file);
-                setPendingAttachments(prev => [...prev, data]);
-            }
-        } catch (err) {
-            console.error('Attachment upload error:', err);
-            alert(`⚠️ Attachment upload failed: ${err.message}`);
-        } finally {
-            setUploading(false);
-        }
-    }
-
-    function removePendingAttachment(storedFilename) {
-        setPendingAttachments(prev => prev.filter(a => a.storedFilename !== storedFilename));
-    }
-
-    function updateLastAiMessage(displayText) {
-        setMessages(prev => {
-            const next = [...prev];
-            next[next.length - 1] = { sender: 'AI', text: displayText };
-            return next;
-        });
-    }
-
-    function finalizeLastAiMessage(displayText, generatedFiles) {
-        setMessages(prev => {
-            const next = [...prev];
-            next[next.length - 1] = { sender: 'AI', text: displayText, generatedFiles: generatedFiles || [] };
-            return next;
-        });
-    }
-
-    // `silent`: used by the Anki heartbeat's proactive nudge (see App.jsx's
-    // triggerSystemNudge via the imperative handle below) — the prompt
-    // still gets sent to the backend as a real user-role turn (the model
-    // needs something to respond to), it's just not rendered as a "You:"
-    // bubble live. NOTE: if this conversation is reopened later,
-    // loadConversation has no way to know that turn was synthetic, so it
-    // WILL show up as a "You:" line on reload — a known, accepted gap
-    // rather than something silently hidden forever.
-    async function sendMessage(overrideText, { silent = false } = {}) {
-        const trimmed = (typeof overrideText === 'string' ? overrideText : input).trim();
-
-        if ((!trimmed && pendingAttachments.length === 0) || loading || !conversationId) return;
-
-        if (!silent && onUserActivity) onUserActivity();
-
-        const attachmentsToSend = [...pendingAttachments];
-
-        setMessages(prev => [
-            ...prev,
-            ...(silent ? [] : [{ sender: 'You', text: trimmed, attachments: attachmentsToSend }]),
-            { sender: 'AI', text: '' },
-        ]);
-
-        setInput('');
-        setPendingAttachments([]);
-        setLoading(true);
-
-        let rawBuffer = '';
-        let finalPayload = null;
-
-        function onDelta(content) {
-            rawBuffer += content;
-            updateLastAiMessage(cleanTextForDisplay(getSafeDisplayPrefix(rawBuffer)));
-            if (onReplyChunk) onReplyChunk(rawBuffer, { done: false });
-        }
-
-        function onDone(event) {
-            finalPayload = event;
-        }
-
-        // The model decided (via the view_screen tool, from context — no
-        // keyword matching anymore) that it needs to see the screen.
-        // Capture a frame from the already-open session stream, upload it
-        // through the normal attachments endpoint, then hit /chat/continue
-        // to resume the SAME reply with that frame injected. Loops back
-        // into consumeNdjsonStream, so a second/third view_screen call in
-        // the same reply (unlikely, but possible) just repeats this.
-        async function onNeedScreenFrame(event) {
-            if (!onGrabScreenFrame) {
-                throw new Error('Screen capture requested but not available.');
-            }
-            const frameFile = await onGrabScreenFrame();
-            if (!frameFile) {
-                throw new Error('Could not capture a screen frame — is sharing still active?');
-            }
-            const uploadedFrame = await uploadAttachment(frameFile);
-
-            const continueRes = await apiFetch('/api/chat/continue', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', ...authHeaders() },
-                body: JSON.stringify({
-                    conversationId,
-                    toolCallId: event.toolCallId,
-                    attachment: uploadedFrame,
-                    screenSessionActive,
-                }),
-            });
-
-            if (!continueRes.ok || !continueRes.body) {
-                const data = await continueRes.json().catch(() => ({}));
-                throw new Error(data.error || `Continue request failed (${continueRes.status})`);
-            }
-
-            await consumeNdjsonStream(continueRes, { onDelta, onDone, onNeedScreenFrame });
-        }
-
-        try {
-            const res = await apiFetch('/api/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', ...authHeaders() },
-                body: JSON.stringify({
-                    message: trimmed,
-                    conversationId,
-                    attachments: attachmentsToSend.length > 0 ? attachmentsToSend : undefined,
-                    screenSessionActive,
-                }),
-            });
-
-            if (!res.ok || !res.body) {
-                const data = await res.json().catch(() => ({}));
-                throw new Error(data.error || `Request failed (${res.status})`);
-            }
-
-            await consumeNdjsonStream(res, { onDelta, onDone, onNeedScreenFrame });
-
-            if (!finalPayload) throw new Error('Stream ended without a final response.');
-
-            finalizeLastAiMessage(cleanTextForDisplay(finalPayload.reply), finalPayload.generatedFiles);
-            if (onReplyChunk) onReplyChunk(finalPayload.reply, { done: true });
-            if (onUiEvents && Array.isArray(finalPayload.uiEvents) && finalPayload.uiEvents.length > 0) {
-                onUiEvents(finalPayload.uiEvents);
-            }
-            if (onConversationUpdated) onConversationUpdated(finalPayload.title);
-
-        } catch (err) {
-            console.error('Chat error:', err);
-            updateLastAiMessage('⚠️ Error connecting to AI. Please check settings and server status.');
-        } finally {
-            setLoading(false);
-        }
-    }
-
     useImperativeHandle(ref, () => ({
-        // Sends a hidden system-style prompt for the AI to react to,
-        // without a "You:" bubble appearing live. See the Anki heartbeat
-        // note above sendMessage for the one known caveat (reappears on
-        // reload).
+        // Persist nudges as user turns, but hide their live chat bubble.
         triggerSystemNudge: (text) => sendMessage(text, { silent: true }),
     }));
 
@@ -389,6 +132,9 @@ const ChatBox = forwardRef(function ChatBox({
 
     return (
         <div className="chat-container">
+            {loadError && <p role="alert">{loadError}</p>}
+            {screenFrame && !loading && <button type="button" onClick={retryScreenFrame}>Retry screen capture</button>}
+            {loadingConversation && <p>Loading conversation...</p>}
             <div className="chat-log" ref={chatLogRef}>
                 {messages.map((msg, i) => (
                     <div key={i} className="chat-message">
@@ -463,7 +209,7 @@ const ChatBox = forwardRef(function ChatBox({
                 <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={loading || !conversationId || uploading}
+                    disabled={Boolean(screenFrame) || loadingConversation || Boolean(loadError) || loading || !conversationId || uploading}
                     title="Attach files"
                 >
                     📎
@@ -477,7 +223,7 @@ const ChatBox = forwardRef(function ChatBox({
                         onMouseLeave={() => isVoiceListening && stopPushToTalk()}
                         onTouchStart={(e) => { e.preventDefault(); startPushToTalk(); }}
                         onTouchEnd={(e) => { e.preventDefault(); stopPushToTalk(); }}
-                        disabled={loading || !conversationId || isVoiceTranscribing}
+                        disabled={Boolean(screenFrame) || loadingConversation || Boolean(loadError) || loading || !conversationId || isVoiceTranscribing}
                         title="Hold to record"
                         className={isVoiceListening ? 'mic-active' : ''}
                     >
@@ -491,9 +237,9 @@ const ChatBox = forwardRef(function ChatBox({
                     onChange={(e) => setInput(e.target.value)}
                     onKeyPress={handleKeyPress}
                     placeholder={!conversationId ? 'Loading...' : loading ? '...' : 'Type a message...'}
-                    disabled={loading || !conversationId}
+                    disabled={Boolean(screenFrame) || loadingConversation || Boolean(loadError) || loading || !conversationId}
                 />
-                <button onClick={() => sendMessage()} disabled={loading || !conversationId || uploading}>Send</button>
+                <button onClick={() => sendMessage()} disabled={Boolean(screenFrame) || loadingConversation || Boolean(loadError) || loading || !conversationId || uploading}>Send</button>
             </div>
         </div>
     );

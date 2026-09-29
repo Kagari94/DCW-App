@@ -10,7 +10,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+const { validateConversationId } = require('../conversations');
 const router = express.Router();
+router.param('conversationId', (req, res, next, id) => {
+    try { validateConversationId(id); next(); }
+    catch (error) { res.status(400).json({ error: error.message }); }
+});
 
 const ATTACHMENTS_ROOT = path.join(__dirname, '../data/attachments');
 
@@ -66,7 +71,7 @@ router.get('/conversations/:conversationId/attachments/:storedFilename', (req, r
 
     // Reject anything that resolves outside this conversation's own folder
     // (path traversal guard against a crafted storedFilename like "../../x").
-    if (!filePath.startsWith(conversationDir)) {
+    if (!filePath.startsWith(conversationDir + path.sep)) {
         return res.status(400).json({ error: 'Invalid path.' });
     }
 

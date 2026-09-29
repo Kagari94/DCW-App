@@ -1,6 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { authHeaders } from '../utils/authToken';
 import { apiFetch } from '../apiConfig';
+import useLatestCallback from './useLatestCallback';
+import { readNdjson } from '../utils/ndjson';
 
 // Opens ONE long-lived connection to /api/events and calls onEvent(event)
 // for every JSON line the server pushes (currently just Anki due-card
@@ -15,12 +17,7 @@ import { apiFetch } from '../apiConfig';
 const RECONNECT_DELAY_MS = 5000;
 
 export default function useReminderStream(onEvent) {
-    // Wrapped in a ref so the effect below never needs onEvent as a
-    // dependency — a new onEvent identity every render (common for an
-    // inline arrow function passed from a parent) would otherwise tear
-    // down and reopen this connection constantly.
-    const onEventRef = useRef(onEvent);
-    onEventRef.current = onEvent;
+    const handleEvent = useLatestCallback(onEvent);
 
     useEffect(() => {
         let cancelled = false;
@@ -36,26 +33,9 @@ export default function useReminderStream(onEvent) {
                     });
                     if (!res.ok || !res.body) throw new Error(`Events stream failed (${res.status})`);
 
-                    const reader = res.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
-
-                    while (!cancelled) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-
-                        buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop();
-
-                        for (const line of lines) {
-                            if (!line.trim()) continue;
-                            try {
-                                onEventRef.current(JSON.parse(line));
-                            } catch (err) {
-                                console.error('Malformed event line:', err);
-                            }
-                        }
+                    for await (const event of readNdjson(res)) {
+                        if (cancelled) break;
+                        handleEvent(event);
                     }
                 } catch (err) {
                     if (cancelled || err.name === 'AbortError') return;
@@ -74,5 +54,5 @@ export default function useReminderStream(onEvent) {
             cancelled = true;
             abortController?.abort();
         };
-    }, []);
+    }, [handleEvent]);
 }
