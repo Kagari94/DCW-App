@@ -6,14 +6,16 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+const crypto = require('node:crypto');
 const { getSettings, updateSettings } = require('../settings.js');
-const { syncPrompt } = require('../scripts/syncExpressions.js');
+const { CHARACTERS_DIR, animationFile, directoryFor, readCharacter, listCharacters,
+    createCharacter, updateCharacter, voiceFromSettings } = require('../lib/characters.js');
 const CONFIG = require('../config.js');
 const { getHttpsAgent } = require('../lib/httpAgents.js');
 
 const router = express.Router();
+router.use(require('./outfits'));
 
-const CHARACTERS_DIR = path.join(__dirname, '../../client/public/models/characters');
 const POCKET_VOICES_DIR = path.join(__dirname, '../data/voices');
 
 // ---- GET/POST current settings ----
@@ -29,13 +31,23 @@ router.post('/settings', (req, res) => {
         }
     }
 
-    const updated = updateSettings(req.body);
-
-    if (req.body.currentCharacter) {
-        syncPrompt(req.body.currentCharacter);
+    try {
+        const before = getSettings();
+        const updated = updateSettings(req.body);
+        if (req.body.stockMonitor) {
+            require('../lib/stocks/service').getStockService().changed();
+            require('../lib/heartbeat/registry').refreshHeartbeat('stock-monitor');
+        }
+        const inferenceSettings = config => JSON.stringify([
+            config.AI_API_URL, config.MODEL_NAME, config.API_KEY, config.CA_CERT_PATH,
+        ]);
+        if (inferenceSettings(before) !== inferenceSettings(updated)) {
+            require('../lib/memory/index.js').resumeMemoryJobs();
+            require('../lib/stocks/service').getStockService().retryFailed();
+        }
+        res.json(updated);
     }
-
-    res.json(updated);
+    catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 // Known-good OpenAI API model ids as of when this list was last updated —
@@ -93,24 +105,43 @@ router.get('/models', async (req, res) => {
 // ---- List available VRM character files ----
 router.get('/characters', (req, res) => {
     try {
-        if (!fs.existsSync(CHARACTERS_DIR)) {
-            return res.json({ characters: [] });
-        }
-        const files = fs.readdirSync(CHARACTERS_DIR).filter(f => f.toLowerCase().endsWith('.vrm'));
-        res.json({ characters: files });
+        res.json({ characters: listCharacters() });
     } catch (error) {
         console.error('❌ Failed to list characters:', error.message);
         res.status(500).json({ error: 'Could not list characters.', characters: [] });
     }
 });
 
+router.post('/characters/from-existing', (req, res) => {
+    try {
+        const existing = readCharacter(req.body.existingFile);
+        if (!existing?.legacy) return res.status(400).json({ error: 'Select an existing VRM file.' });
+        const character = createCharacter({
+            name: req.body.name || existing.name,
+            personality: req.body.personality || '',
+            legacyFile: existing.id,
+            voice: voiceFromSettings(getSettings()),
+        });
+        res.status(201).json({ character });
+    } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+router.patch('/characters/:id', (req, res) => {
+    try { res.json({ character: updateCharacter(req.params.id, req.body) }); }
+    catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
 // ---- Upload a new VRM file ----
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        if (!fs.existsSync(CHARACTERS_DIR)) fs.mkdirSync(CHARACTERS_DIR, { recursive: true });
-        cb(null, CHARACTERS_DIR);
+        try {
+            req.characterId = crypto.randomUUID();
+            const directory = directoryFor(req.characterId);
+            fs.mkdirSync(directory, { recursive: true });
+            cb(null, directory);
+        } catch (error) { cb(error); }
     },
-    filename: (req, file, cb) => cb(null, file.originalname),
+    filename: (req, file, cb) => cb(null, 'model.vrm'),
 });
 
 const upload = multer({
@@ -128,7 +159,42 @@ router.post('/characters/upload', upload.single('vrm'), (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded, or it was rejected (must be .vrm).' });
     }
-    res.json({ filename: req.file.filename });
+    try {
+        const character = createCharacter({
+            id: req.characterId,
+            name: req.body.name || path.parse(path.basename(req.file.originalname)).name,
+            personality: req.body.personality || '',
+            model: 'model.vrm',
+            voice: voiceFromSettings(getSettings()),
+        });
+        res.status(201).json({ character });
+    } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+const animationUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            try {
+                const directory = path.join(directoryFor(req.params.id), 'animations');
+                if (!fs.existsSync(path.join(directoryFor(req.params.id), 'character.json'))) return cb(new Error('Character not found.'));
+                fs.mkdirSync(directory, { recursive: true });
+                cb(null, directory);
+            } catch (error) { cb(error); }
+        },
+        filename: (req, file, cb) => {
+            const name = path.basename(file.originalname);
+            if (name !== file.originalname || !animationFile(name)) return cb(new Error('Only .vrma and .json animations are allowed.'));
+            cb(null, name);
+        },
+    }),
+    limits: { fileSize: 100 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => cb(null, animationFile(file.originalname) && path.basename(file.originalname) === file.originalname),
+});
+
+router.post('/characters/:id/animations/upload', animationUpload.single('animation'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'Select a .vrma or .json animation.' });
+    try { res.status(201).json({ character: readCharacter(req.params.id) }); }
+    catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 const voiceUploadStorage = multer.diskStorage({
@@ -194,6 +260,12 @@ router.get('/pocket-voices', (req, res) => {
     } catch (error) {
         res.status(500).json({ error: 'Could not list pocket-tts voices.', voices: [] });
     }
+});
+
+router.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    const badUpload = error instanceof multer.MulterError || /Only .+ files are allowed|Character not found/.test(error.message);
+    res.status(error.status || (badUpload ? 400 : 500)).json({ error: error.message });
 });
 
 module.exports = router;

@@ -6,7 +6,15 @@ const path = require('path');
 const multer = require('multer');
 const { getSettings } = require('../settings.js');
 const { transcribe } = require('../lib/speechToText.js');
+const { relayPocketStream } = require('../lib/pocketTtsStream.js');
 const router = express.Router();
+const { beginForeground } = require('../lib/memory/foreground');
+router.use(['/voice', '/transcribe'], (req, res, next) => {
+    const release = beginForeground();
+    res.once('finish', release);
+    res.once('close', release);
+    next();
+});
 
 let KokoroTTS;
 let ttsInstance = null;
@@ -106,8 +114,7 @@ router.post('/voice', async (req, res) => {
     }
 });
 
-//Audio streaming
-async function streamPocketTtsAudio(text, CONFIG, res) {
+async function streamPocketTtsAudio(text, CONFIG, res, signal) {
     const axios = require('axios');
     const pocketConfig = CONFIG.pocketTts || {};
     const baseUrl = pocketConfig.baseUrl || 'http://localhost:8000';
@@ -121,45 +128,10 @@ async function streamPocketTtsAudio(text, CONFIG, res) {
     const upstream = await axios.post(`${baseUrl}/tts`, params, {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         responseType: 'stream',
+        signal,
+        timeout: 60000,
     });
-
-    let headerBuf = Buffer.alloc(0);
-    let headerParsed = false;
-
-    return new Promise((resolve, reject) => {
-        upstream.data.on('data', (chunk) => {
-            if (!headerParsed) {
-                headerBuf = Buffer.concat([headerBuf, chunk]);
-                if (headerBuf.length < 44) return;
-
-                const sampleRate = headerBuf.readUInt32LE(24);
-                const channels = headerBuf.readUInt16LE(22);
-                const bitsPerSample = headerBuf.readUInt16LE(34);
-
-                res.writeHead(200, {
-                    'Content-Type': 'application/octet-stream',
-                    'X-Sample-Rate': String(sampleRate),
-                    'X-Channels': String(channels),
-                    'X-Bits-Per-Sample': String(bitsPerSample),
-                    'Transfer-Encoding': 'chunked',
-                    'Access-Control-Expose-Headers': 'X-Sample-Rate, X-Channels, X-Bits-Per-Sample',
-                });
-
-                const remainder = headerBuf.subarray(44);
-                if (remainder.length) res.write(remainder);
-                headerParsed = true;
-                return;
-            }
-            res.write(chunk);
-        });
-
-        upstream.data.on('end', () => {
-            res.end();
-            resolve();
-        });
-
-        upstream.data.on('error', reject);
-    });
+    await relayPocketStream(upstream.data, res, signal);
 }
 
 router.post('/voice/stream', async (req, res) => {
@@ -174,15 +146,25 @@ router.post('/voice/stream', async (req, res) => {
         return res.status(400).json({ error: 'Streaming is only supported with the pocket-tts backend.' });
     }
 
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    res.on('close', onClose);
     try {
-        await withPocketTtsLock(() => streamPocketTtsAudio(text, CONFIG, res));
+        await withPocketTtsLock(() => {
+            controller.signal.throwIfAborted();
+            return streamPocketTtsAudio(text, CONFIG, res, controller.signal);
+        });
     } catch (error) {
+        if (controller.signal.aborted) return;
         console.error('❌ TTS Stream Error:', error);
         if (!res.headersSent) {
             res.status(500).json({ error: `⚠️ TTS Stream Error: ${error.message}` });
         } else {
-            res.end();
+            // A normal end would disguise a truncated sentence as success.
+            res.destroy();
         }
+    } finally {
+        res.off('close', onClose);
     }
 });
 

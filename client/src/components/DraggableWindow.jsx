@@ -7,7 +7,7 @@ import { getPref, setPref } from '../utils/localPrefs';
 // "Weather", "Flashcard Review", "Settings") are already stable strings,
 // so the default is normally enough; pass persistKey explicitly only if
 // two windows might ever share a title.
-function DraggableWindow({ title, persistKey, headerExtra, children, initialX = 40, initialY = 40, width = 380 }) {
+function DraggableWindow({ title, persistKey, headerExtra, onClose, children, initialX = 40, initialY = 40, width = 380 }) {
     const storageKey = `window:${persistKey || title}`;
     const [saved] = useState(() => getPref(storageKey, null));
 
@@ -16,7 +16,7 @@ function DraggableWindow({ title, persistKey, headerExtra, children, initialX = 
         x: saved?.x ?? initialX,
         y: saved?.y ?? initialY,
     }));
-    const [collapsed, setCollapsed] = useState(saved?.collapsed ?? false);
+    const [collapsed, setCollapsed] = useState(onClose ? false : (saved?.collapsed ?? false));
     const draggingRef = useRef(false);
     const offsetRef = useRef({ x: 0, y: 0 });
 
@@ -87,10 +87,13 @@ function DraggableWindow({ title, persistKey, headerExtra, children, initialX = 
                     </div>
                 )}
                 <button
+                    type="button"
                     className="window-toggle draggable-window-toggle"
-                    onClick={() => setCollapsed(prev => !prev)}
+                    onClick={onClose || (() => setCollapsed(prev => !prev))}
+                    aria-label={onClose ? `Close ${title}` : (collapsed ? `Expand ${title}` : `Minimize ${title}`)}
+                    title={onClose ? `Close ${title}` : (collapsed ? `Expand ${title}` : `Minimize ${title}`)}
                 >
-                    {collapsed ? '+' : '−'}
+                    {onClose ? '×' : (collapsed ? '+' : '−')}
                 </button>
             </div>
             {!collapsed && (

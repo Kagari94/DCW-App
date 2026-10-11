@@ -26,7 +26,8 @@ function createConversationStore(CONV_DIR, io = fs) {
         const list = files.flatMap(f => {
             try {
                 const data = loadConversation(f.slice(0, -5));
-                return data ? [{ id: data.id, title: data.title, updatedAt: data.updatedAt }] : [];
+                return data ? [{ id: data.id, title: data.title, updatedAt: data.updatedAt,
+                    characterId: data.characterId || null, messageCount: data.messages.length }] : [];
             } catch (error) {
                 console.warn(`Skipping unreadable conversation ${f}: ${error.message}`);
                 return [];
@@ -59,13 +60,14 @@ function createConversationStore(CONV_DIR, io = fs) {
         return conversation;
     }
 
-    function createConversation(systemPrompt) {
+    function createConversation(systemPrompt, characterId = null) {
         const id = crypto.randomUUID();
         const conversation = {
             id,
             title: 'New conversation',
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+            characterId,
             messages: [{ role: 'system', content: systemPrompt }],
         };
         saveConversation(conversation);

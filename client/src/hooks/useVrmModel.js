@@ -6,7 +6,6 @@ import { setupSpringBoneColliders } from '../utils/springBoneColliders';
 import { loadAllAnimations } from '../utils/animationLoader';
 import { MANUAL_EYE_CLOSING_EXPRESSIONS } from './useExpressions';
 
-const CHARACTERS_BASE_PATH = '/models/characters';
 const DEFAULT_Y_OFFSET = -0.4;
 
 function disposeVrmScene(vrmScene) {
@@ -28,7 +27,7 @@ function disposeVrmScene(vrmScene) {
 // Everything else — expressions, animation playback — is wired up here
 // once the model is ready, via the functions passed in.
 export default function useVrmModel({
-    characterFile,
+    character,
     sceneRef,
     vrmRef,
     mixerRef,
@@ -43,10 +42,22 @@ export default function useVrmModel({
     startIdleRotation,
     startFlourishLoop,
 }) {
+    const animationSignature = JSON.stringify(character?.animations || []);
     useEffect(() => {
-        if (!characterFile) return;
         const scene = sceneRef.current;
         if (!scene) return;
+
+        if (!character?.modelUrl) {
+            if (vrmRef.current) {
+                scene.remove(vrmRef.current.scene);
+                disposeVrmScene(vrmRef.current.scene);
+                vrmRef.current = null;
+            }
+            loadedAnimationsRef.current = {};
+            mixerRef.current = null;
+            animationsReadyRef.current = false;
+            return;
+        }
 
         // Guards against two loads racing — either from React StrictMode's dev-only
         // double-invoke, or a genuine rapid character swap that starts a second load
@@ -57,6 +68,8 @@ export default function useVrmModel({
         // animation clips could end up bound to a skeleton that's no longer the one
         // being rendered, so idle would "play" on a mixer nothing was watching.
         let cancelled = false;
+        let stopAnimationLoops;
+        let stopBlinking;
 
         if (vrmRef.current) {
             scene.remove(vrmRef.current.scene);
@@ -71,7 +84,7 @@ export default function useVrmModel({
         animationsReadyRef.current = false;
         eyeClosingExpressionsRef.current = [];
 
-        const vrmPath = `${CHARACTERS_BASE_PATH}/${characterFile}`;
+        const vrmPath = character.modelUrl;
 
         const loader = new GLTFLoader();
         loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -90,12 +103,35 @@ export default function useVrmModel({
 
                 VRMUtils.rotateVRM0(vrm);
 
+                // The original face used stylized shading that glTF's plain PBR
+                // material cannot carry. Restore a little contour on its skin
+                // without changing lighting or materials elsewhere in the scene.
+                if (character.modelName.toLowerCase().startsWith('hsin_')) {
+                    vrm.scene.traverse((obj) => {
+                        if (!obj.isMesh || !/^VRM_Face[ _](Default|Enhanced)/.test(obj.name)) return;
+                        const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+                        materials.filter((mat) => mat?.name.includes('GS_Face')).forEach((mat) => {
+                            const originalCompile = mat.onBeforeCompile;
+                            mat.onBeforeCompile = (shader, renderer) => {
+                                originalCompile.call(mat, shader, renderer);
+                                const marker = '#include <normal_fragment_maps>';
+                                shader.fragmentShader = shader.fragmentShader.replace(
+                                    marker,
+                                    `${marker}\n diffuseColor.rgb *= 0.78 + 0.22 * max(dot(normal, normalize(vec3(-0.45, 0.25, 0.86))), 0.0);`
+                                );
+                            };
+                            mat.customProgramCacheKey = () => 'hsin-face-contour-v1';
+                            mat.needsUpdate = true;
+                        });
+                    });
+                }
+
                 vrmRef.current = vrm;
                 vrm.scene.position.y = DEFAULT_Y_OFFSET;
                 setupSpringBoneColliders(vrm);
                 scene.add(vrm.scene);
 
-                console.log('VRM loaded:', characterFile);
+                console.log('VRM loaded:', character.name);
 
                 const detected = getEyeClosingExpressionNames(vrm);
                 eyeClosingExpressionsRef.current = [...new Set([...detected, ...MANUAL_EYE_CLOSING_EXPRESSIONS])];
@@ -103,17 +139,24 @@ export default function useVrmModel({
 
                 mixerRef.current = new THREE.AnimationMixer(vrm.humanoid.normalizedHumanBonesRoot);
 
+                const animationsForModel = { current: loadedAnimationsRef.current };
+                const vrmForAnimations = { current: vrm };
                 loadAllAnimations({
-                    vrmRef,
-                    loadedAnimationsRef,
+                    character,
+                    vrmRef: vrmForAnimations,
+                    loadedAnimationsRef: animationsForModel,
                     animationsReadyRef,
                     playRandomIdle,
                     startIdleRotation,
                     startFlourishLoop,
-                });
+                    isCurrent: () => !cancelled && loadedAnimationsRef.current === animationsForModel.current,
+                }).then(stop => {
+                    if (cancelled) stop?.();
+                    else stopAnimationLoops = stop;
+                }).catch(error => console.error('Could not load character animations:', error));
 
                 console.log('Starting blink loop...');
-                startBlinking();
+                stopBlinking = startBlinking();
             },
             (progress) => {
                 console.log('Loading VRM:', Math.round((progress.loaded / progress.total) * 100) + '%');
@@ -125,7 +168,9 @@ export default function useVrmModel({
 
         return () => {
             cancelled = true;
+            stopAnimationLoops?.();
+            stopBlinking?.();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [characterFile]);
+    }, [character?.modelUrl, animationSignature]);
 }

@@ -6,6 +6,10 @@ const { runToolLoop } = require('./toolLoop');
 const { getToolDefinitions, getToolHandlers } = require('../tools');
 const { buildExpandedMessages } = require('./attachmentProcessor.js');
 const { defaultHttpAgent, getHttpsAgent } = require('./httpAgents.js');
+const { readCharacter } = require('./characters.js');
+const { isSimpleSocialTurn, requestContextStats } = require('./chatContext.js');
+const { StringDecoder } = require('node:string_decoder');
+const { InvalidModelOutputError, modelOutputState } = require('./modelOutput.js');
 
 function isConnectionReset(err) {
     return err.code === 'ECONNRESET' || err.message === 'socket hang up';
@@ -66,6 +70,23 @@ function withMemoryContext(messages, memoryContextText) {
 
 const MAX_ITERATIONS = 6; // raised from 4 — image-viewing workflows (list -> view -> rename) add extra hops
 
+function withCharacterContext(messages, characterId, lookup = readCharacter) {
+    if (!characterId) return messages;
+    const character = lookup(characterId);
+    if (!character || character.legacy) return messages;
+    const animations = character.animations.filter(item => !item.name.startsWith('idle_') && !item.name.startsWith('flourish_'));
+    const base = messages[0].content;
+    const prompt = animations.length
+        ? base.replace(/The available animations are: ([^\n]+)/,
+            (_line, common) => `The available animations are: ${common.replace(/\.$/, '')}, ${animations.map(item => item.name).join(', ')}.`)
+        : base;
+    const identity = `You are ${character.name}, the currently selected companion.` +
+        (character.personality ? `\nYour character-specific personality and manner: ${character.personality}` : '');
+    const outfit = character.outfits?.find(item => item.id === character.activeOutfit);
+    const appearance = outfit ? `\nCurrent outfit: ${outfit.name}. Use list_outfits to discover saved outfits and change_outfit when the user asks or agrees.` : '';
+    return [{ ...messages[0], content: `${prompt}\n\n${identity}${appearance}` }, ...messages.slice(1)];
+}
+
 // One streaming attempt. Resolves with the assembled assistant message.
 // `onFirstDelta` fires the moment any content reaches the client — the
 // caller uses it to know whether a retry is still safe (see callModel).
@@ -87,10 +108,13 @@ function streamOnce(requestBody, config, onContentDelta, onFirstDelta) {
     }).then(response => new Promise((resolve, reject) => {
         let buffer = '';
         let content = '';
+        let publishedLength = 0;
+        let failed = false;
+        const decoder = new StringDecoder('utf8');
         const toolCallAccumulator = {};
 
         response.data.on('data', (chunk) => {
-            buffer += chunk.toString('utf8');
+            buffer += decoder.write(chunk);
             const lines = buffer.split('\n');
             buffer = lines.pop();
 
@@ -112,9 +136,19 @@ function streamOnce(requestBody, config, onContentDelta, onFirstDelta) {
                 const delta = choice.delta || {};
 
                 if (delta.content) {
-                    if (content === '') onFirstDelta();
                     content += delta.content;
-                    if (onContentDelta) onContentDelta(delta.content);
+                    const state = modelOutputState(content);
+                    if (state === 'invalid') {
+                        failed = true;
+                        reject(new InvalidModelOutputError());
+                        response.data.destroy();
+                        return;
+                    }
+                    if (state === 'valid') {
+                        if (publishedLength === 0) onFirstDelta();
+                        if (onContentDelta) onContentDelta(content.slice(publishedLength));
+                        publishedLength = content.length;
+                    }
                 }
 
                 if (delta.tool_calls) {
@@ -136,9 +170,14 @@ function streamOnce(requestBody, config, onContentDelta, onFirstDelta) {
         });
 
         response.data.on('end', () => {
+            if (failed) return;
             const toolCalls = Object.keys(toolCallAccumulator).length > 0
                 ? Object.values(toolCallAccumulator)
                 : undefined;
+            if (content.length > publishedLength) {
+                if (publishedLength === 0) onFirstDelta();
+                if (onContentDelta) onContentDelta(content.slice(publishedLength));
+            }
             resolve({ role: 'assistant', content: content || null, tool_calls: toolCalls });
         });
 
@@ -147,14 +186,14 @@ function streamOnce(requestBody, config, onContentDelta, onFirstDelta) {
 }
 
 async function callModel(messages, config, onContentDelta) {
-    const toolDefinitions = getToolDefinitions();
+    const toolDefinitions = isSimpleSocialTurn(messages) ? [] : getToolDefinitions();
 
     // Expanded fresh on every call, not once upfront — this is what lets a
     // tool (like view_image) inject a new lean attachment mid-loop and have
     // it actually reach the model on the very next call, while what gets
     // persisted (`messages`, mutated below) stays lean path-only metadata.
     const withDate = withCurrentDateTime(await buildExpandedMessages(messages));
-    const expandedMessages = withMemoryContext(withDate, config.memoryContext);
+    const expandedMessages = withMemoryContext(withCharacterContext(withDate, config.characterId), config.memoryContext);
 
     if (config.DEBUG) {
         const last = expandedMessages[expandedMessages.length - 1];
@@ -173,6 +212,7 @@ async function callModel(messages, config, onContentDelta) {
         tools: toolDefinitions.length > 0 ? toolDefinitions : undefined,
         stream: true,
     };
+    if (config.DEBUG) console.log('AI request context:', requestContextStats(requestBody));
 
     // A dropped connection is only safely retryable while NOTHING has been
     // streamed to the client yet — once deltas are out, replaying the call
@@ -206,4 +246,4 @@ function runWithTools(messages, config, onContentDelta) {
     });
 }
 
-module.exports = { runWithTools };
+module.exports = { runWithTools, withCharacterContext };

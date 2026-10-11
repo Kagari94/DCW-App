@@ -69,9 +69,9 @@ export default function ToolsMenu({ embedded = false }) {
                 className="tools-menu-toggle"
                 onClick={() => setOpen(o => !o)}
                 aria-expanded={open}
-                title="Tools available to the AI"
+                title="Tools"
             >
-                <span>🔧 {embedded && 'Tools menu · '}{Object.keys(grouped).length}</span>
+                <span>🔧 {embedded && 'Tools · '}{Object.keys(grouped).length}</span>
                 {embedded && <span>{open ? '▾' : '▸'}</span>}
             </button>
 

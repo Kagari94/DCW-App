@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiJson } from '../apiConfig';
 import useLatestCallback from './useLatestCallback';
+import { normalizeCharacterCatalog, normalizeCharacterSettings } from '../utils/characters';
 
 function mergeSettings(current, patch) {
     const result = { ...current };
@@ -14,6 +15,7 @@ function mergeSettings(current, patch) {
 export default function useSettings(onSettingsChange) {
     const [settings, setSettings] = useState(null);
     const [characters, setCharacters] = useState([]);
+    const [supportsProfiles, setSupportsProfiles] = useState(true);
     const [voices, setVoices] = useState([]);
     const [pocketVoiceFiles, setPocketVoiceFiles] = useState([]);
     const [error, setError] = useState(null);
@@ -29,9 +31,10 @@ export default function useSettings(onSettingsChange) {
             .map(path => apiJson(path, options)))
             .then(([data, charactersData, voicesData, pocketData]) => {
                 if (controller.signal.aborted) return;
-                latest.current = data;
-                setSettings(data);
-                setCharacters(charactersData.characters || []);
+                latest.current = normalizeCharacterSettings(data);
+                setSettings(latest.current);
+                setCharacters(normalizeCharacterCatalog(charactersData.characters));
+                setSupportsProfiles(Object.hasOwn(data, 'character'));
                 setVoices(voicesData.voices || []);
                 setPocketVoiceFiles(pocketData.voices || []);
             }).catch(error => { if (!controller.signal.aborted) setError(error.message); });
@@ -50,25 +53,63 @@ export default function useSettings(onSettingsChange) {
         const request = saves.current.then(() => apiJson('/api/settings', { method: 'POST', body }));
         saves.current = request.catch(() => {});
         return request.then(data => {
+            const normalized = normalizeCharacterSettings(data);
             if (currentRevision === revision.current) {
-                latest.current = data;
-                setSettings(data);
+                latest.current = normalized;
+                setSettings(normalized);
             }
-            notify(data);
-            return data;
+            notify(normalized);
+            return normalized;
         }).catch(error => { setError(error.message); return null; });
     }
 
-    async function upload(path, field, file) {
+    async function upload(path, field, file, fields = {}) {
         const body = new FormData();
         body.append(field, file);
+        for (const [key, value] of Object.entries(fields)) body.append(key, value);
         return apiJson(path, { method: 'POST', body });
     }
-    async function uploadCharacter(file) {
-        const data = await upload('/api/characters/upload', 'vrm', file);
+    async function uploadCharacter(file, details = {}) {
+        const data = await upload('/api/characters/upload', 'vrm', file, details);
         const list = await apiJson('/api/characters');
-        setCharacters(list.characters || []);
-        await saveSetting({ currentCharacter: data.filename });
+        setCharacters(normalizeCharacterCatalog(list.characters));
+        if (!await saveSetting({ currentCharacter: data.character?.id || data.filename })) {
+            throw new Error('Companion created, but selection failed. Select it in Model.');
+        }
+    }
+    async function createCharacterFromExisting(existingFile, name, personality = '') {
+        const result = await apiJson('/api/characters/from-existing', {
+            method: 'POST', body: JSON.stringify({ existingFile, name, personality }),
+        });
+        const list = await apiJson('/api/characters');
+        setCharacters(normalizeCharacterCatalog(list.characters));
+        if (!await saveSetting({ currentCharacter: result.character.id })) {
+            throw new Error('Companion created, but selection failed. Select it in Model.');
+        }
+    }
+    function refreshCharacter(task) {
+        const request = saves.current.then(async () => {
+            await task();
+            const [list, updated] = await Promise.all([apiJson('/api/characters'), apiJson('/api/settings')]);
+            setCharacters(normalizeCharacterCatalog(list.characters));
+            latest.current = normalizeCharacterSettings(updated);
+            setSettings(latest.current);
+            notify(latest.current);
+            return latest.current;
+        });
+        saves.current = request.catch(() => {});
+        return request;
+    }
+    function updateCharacter(id, patch) {
+        return refreshCharacter(() => apiJson(`/api/characters/${id}`, {
+            method: 'PATCH', body: JSON.stringify(patch),
+        }));
+    }
+    function uploadCharacterAnimation(id, file) {
+        return refreshCharacter(() => upload(`/api/characters/${id}/animations/upload`, 'animation', file));
+    }
+    function uploadCharacterImage(id, file) {
+        return refreshCharacter(() => upload(`/api/characters/${id}/image`, 'image', file));
     }
     async function uploadVoice(file) {
         const data = await upload('/api/pocket-voices/upload', 'voice', file);
@@ -76,6 +117,7 @@ export default function useSettings(onSettingsChange) {
         setPocketVoiceFiles(list.voices || []);
         return data;
     }
-    return { settings, characters, voices, pocketVoiceFiles, error, setError,
-        saveSetting, uploadCharacter, uploadVoice };
+    return { settings, characters, supportsProfiles, voices, pocketVoiceFiles, error, setError,
+        saveSetting, uploadCharacter, createCharacterFromExisting, updateCharacter,
+        uploadCharacterAnimation, uploadCharacterImage, uploadVoice };
 }

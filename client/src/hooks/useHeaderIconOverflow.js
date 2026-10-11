@@ -37,6 +37,8 @@ export default function useHeaderIconOverflow(items, storageKey) {
         const container = containerRef.current;
         if (!container) return;
         const available = container.clientWidth;
+        const styles = window.getComputedStyle(container);
+        const gap = parseFloat(styles.columnGap || styles.gap) || 0;
 
         const widths = order.map(id => itemRefs.current[id]?.offsetWidth || 0);
         const chevronWidth = chevronRef.current?.offsetWidth || 0;
@@ -44,10 +46,10 @@ export default function useHeaderIconOverflow(items, storageKey) {
         let total = 0;
         let fit = 0;
         for (let i = 0; i < widths.length; i++) {
-            total += widths[i];
+            total += widths[i] + (i > 0 ? gap : 0);
             // Reserve room for the chevron unless this is the last item —
             // no point reserving space for a dropdown with nothing in it.
-            const reserve = i < widths.length - 1 ? chevronWidth : 0;
+            const reserve = i < widths.length - 1 ? chevronWidth + gap : 0;
             if (total + reserve > available) break;
             fit = i + 1;
         }

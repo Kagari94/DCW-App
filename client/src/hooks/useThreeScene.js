@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 // Owns the Three.js scene, camera, renderer, controls, lights, resize handling,
 // and the main render loop (mixer.update -> vrm.update -> controls.update -> render).
@@ -44,8 +45,21 @@ export default function useThreeScene({ mixerRef, vrmRef, lighting }) {
         camera.lookAt(0, 1, 0);
 
         const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.NeutralToneMapping;
+        renderer.toneMappingExposure = 1.1;
         renderer.setSize(mount.clientWidth, mount.clientHeight);
         mount.appendChild(renderer.domElement);
+
+        // Give glTF/PBR materials soft reflections and fill without changing
+        // the adjustable key, fill, rim, and ambient lights below.
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        const roomEnvironment = new RoomEnvironment();
+        const environmentMap = pmremGenerator.fromScene(roomEnvironment);
+        scene.environment = environmentMap.texture;
+        scene.environmentIntensity = 0.45;
+        roomEnvironment.dispose();
+        pmremGenerator.dispose();
 
         const controls = new OrbitControls(camera, renderer.domElement);
         controls.target.set(0, 1, 0);
@@ -98,6 +112,8 @@ export default function useThreeScene({ mixerRef, vrmRef, lighting }) {
             cancelAnimationFrame(frameId);
             window.removeEventListener('resize', handleResize);
             controls.dispose();
+            scene.environment = null;
+            environmentMap.dispose();
             mount.removeChild(renderer.domElement);
             renderer.dispose();
         };

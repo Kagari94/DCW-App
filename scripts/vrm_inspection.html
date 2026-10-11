@@ -1,0 +1,118 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>VRM inspection</title>
+<style>html,body{margin:0;background:#666161}canvas{display:block}</style>
+<script type="importmap">{"imports":{
+  "three":"/modules/three/build/three.module.js",
+  "three/":"/modules/three/",
+  "@pixiv/three-vrm":"/modules/@pixiv/three-vrm/lib/three-vrm.module.js",
+  "@pixiv/three-vrm-animation":"/modules/@pixiv/three-vrm-animation/lib/three-vrm-animation.module.js"
+}}</script></head><body>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { loadAnimation } from '/animationLoader.js';
+
+window.addEventListener('error', event => { window.inspectionError = event.message; });
+window.addEventListener('unhandledrejection', event => { window.inspectionError = String(event.reason?.stack || event.reason); });
+try {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x666161);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.NeutralToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  renderer.setPixelRatio(1);
+  document.body.appendChild(renderer.domElement);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const room = new RoomEnvironment();
+  scene.environment = pmrem.fromScene(room).texture;
+  scene.environmentIntensity = 0.45;
+  room.dispose(); pmrem.dispose();
+  for (const [color, intensity, position] of [
+    [0xffd5aa, 1.2, [-3, 2.5, 4]],
+    [0xaaaaff, 0.6, [4, 2, 4]],
+    [0x8888aa, 0.6, [0, 4, 2]],
+  ]) {
+    const light = new THREE.DirectionalLight(color, intensity);
+    light.position.fromArray(position); scene.add(light);
+  }
+  scene.add(new THREE.AmbientLight(0x404040, 0.4));
+  const loader = new GLTFLoader();
+  loader.register(parser => new VRMLoaderPlugin(parser));
+  const gltf = await loader.loadAsync('/model.vrm');
+  const vrm = gltf.userData.vrm;
+  VRMUtils.rotateVRM0(vrm);
+  scene.add(vrm.scene); vrm.update(0); scene.updateMatrixWorld(true);
+  const bounds = new THREE.Box3().setFromObject(vrm.scene);
+  const center = bounds.getCenter(new THREE.Vector3());
+  const height = bounds.max.y - bounds.min.y;
+  const head = vrm.humanoid.getRawBoneNode('head').getWorldPosition(new THREE.Vector3());
+  const chest = vrm.humanoid.getRawBoneNode('chest').getWorldPosition(new THREE.Vector3());
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 100);
+  let idleClip;
+  window.inspectView = async name => {
+    const restore = [];
+    if (name.startsWith('face_')) {
+      vrm.scene.traverse(object => {
+        if (!object.isMesh) return;
+        for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+          if (!material.name.includes('eyeline')) continue;
+          restore.push([material, { visible: material.visible, depthTest: material.depthTest, side: material.side }]);
+          if (name === 'face_no_lash' || (name === 'face_upper_only' && !material.name.includes('eyeline_00_up'))) material.visible = false;
+          if (name === 'face_no_depth') material.depthTest = false;
+          if (name === 'face_double_sided') material.side = THREE.DoubleSide;
+        }
+      });
+    }
+    vrm.expressionManager?.setValue('blink', name === 'blink' ? 1 : 0);
+    let mixer;
+    if (name === 'idle_front') {
+      idleClip ||= await loadAnimation('idle', '/animations/idle_1.json', { current: vrm }, { current: {} });
+      mixer = new THREE.AnimationMixer(vrm.humanoid.normalizedHumanBonesRoot);
+      mixer.clipAction(idleClip).play(); mixer.update(2);
+    }
+    vrm.update(0); scene.updateMatrixWorld(true);
+    const detail = name.startsWith('face') || ['blink', 'chest', 'hand'].includes(name);
+    const width = detail ? 900 : 640;
+    const screenHeight = detail ? 900 : 960;
+    renderer.setSize(width, screenHeight);
+    let focus = new THREE.Vector3(0, center.y, 0);
+    let scale = height * 1.12;
+    if (name.startsWith('face') || name === 'blink') {
+      focus.copy(head).add(new THREE.Vector3(0, 0.08, 0)); scale = 0.42;
+    } else if (name === 'chest') {
+      focus.copy(chest).add(new THREE.Vector3(0, 0.02, 0)); scale = 0.48;
+    } else if (name === 'hand') {
+      focus.copy(vrm.humanoid.getRawBoneNode('leftHand').getWorldPosition(new THREE.Vector3())); scale = 0.27;
+    }
+    camera.top = scale / 2; camera.bottom = -scale / 2;
+    camera.right = scale * width / screenHeight / 2; camera.left = -camera.right;
+    camera.position.copy(focus).add(name === 'back' ? new THREE.Vector3(0, 0, -3)
+      : name === 'side' ? new THREE.Vector3(3, 0, 0)
+      : name === 'top' ? new THREE.Vector3(0, 3, 0.01)
+      : name === 'bottom' ? new THREE.Vector3(0, -3, 0.01)
+      : new THREE.Vector3(0, 0, 3));
+    camera.lookAt(focus); camera.updateProjectionMatrix();
+    renderer.render(scene, camera);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    for (const [material, previous] of restore) Object.assign(material, previous);
+    if (mixer) { mixer.stopAllAction(); vrm.update(0); }
+    return { view: name, width, height: screenHeight, drawCalls: renderer.info.render.calls };
+  };
+  const materials = new Map();
+  vrm.scene.traverse(object => {
+    if (!object.isMesh) return;
+    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+      materials.set(material.name, { name: material.name, type: material.type,
+        alphaTest: material.alphaTest, transparent: material.transparent, depthWrite: material.depthWrite,
+        side: material.side, color: material.color?.toArray() });
+    }
+  });
+  window.inspectionSummary = { version: vrm.meta.metaVersion, head: head.toArray(), chest: chest.toArray(),
+    min: bounds.min.toArray(), max: bounds.max.toArray(), materials: [...materials.values()] };
+  await window.inspectView('front');
+  window.inspectionReady = true;
+} catch (error) { window.inspectionError = error.stack || String(error); }
+</script></body></html>

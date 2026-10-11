@@ -6,6 +6,7 @@ function useLipSync(characterRef) {
     const rafRef = useRef(null);
 
     const startLipSync = useCallback((analyser) => {
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
         const bufferLength = analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
 

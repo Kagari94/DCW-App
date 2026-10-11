@@ -17,6 +17,8 @@ export default function useLiveCamera() {
     const streamRef = useRef(null);
     const videoRef = useRef(null);
     const activeRef = useRef(false); // mirrors `active`, read synchronously inside the async loop
+    const startRequestRef = useRef(0);
+    const startingRef = useRef(false);
     const timeoutRef = useRef(null);
 
     const captureAndSendFrame = useCallback(async () => {
@@ -54,6 +56,7 @@ export default function useLiveCamera() {
     }, [captureAndSendFrame]);
 
     const stop = useCallback(() => {
+        startRequestRef.current++;
         activeRef.current = false;
         setActive(false);
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -63,14 +66,26 @@ export default function useLiveCamera() {
     }, []);
 
     const start = useCallback(async () => {
-        if (activeRef.current) return;
+        if (activeRef.current) return true;
+        if (startingRef.current) return false;
+        startingRef.current = true;
+        const request = ++startRequestRef.current;
+        let stream;
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            if (request !== startRequestRef.current) {
+                stream.getTracks().forEach(track => track.stop());
+                return false;
+            }
             streamRef.current = stream;
 
             const video = document.createElement('video');
             video.srcObject = stream;
             await video.play();
+            if (request !== startRequestRef.current) {
+                stream.getTracks().forEach(track => track.stop());
+                return false;
+            }
             videoRef.current = video;
 
             // Fires if the user stops sharing via the browser's own native
@@ -81,11 +96,18 @@ export default function useLiveCamera() {
             activeRef.current = true;
             setActive(true);
             loop();
+            return true;
         } catch (err) {
-            console.error('Camera session failed to start:', err);
-            if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
+            stream?.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+            videoRef.current = null;
+            if (request === startRequestRef.current && err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
+                console.error('Camera session failed to start:', err);
                 alert(`⚠️ Camera access failed: ${err.message}`);
             }
+            return false;
+        } finally {
+            startingRef.current = false;
         }
     }, [loop, stop]);
 

@@ -118,6 +118,7 @@ const ChatBox = forwardRef(function ChatBox({
     useImperativeHandle(ref, () => ({
         // Persist nudges as user turns, but hide their live chat bubble.
         triggerSystemNudge: (text) => sendMessage(text, { silent: true }),
+        isBusy: () => loading || loadingConversation || isVoiceListening || isVoiceTranscribing,
     }));
 
     function handleKeyPress(e) {

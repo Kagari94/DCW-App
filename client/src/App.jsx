@@ -1,11 +1,14 @@
 import { useRef, useState, useEffect } from 'react';
 import { authHeaders } from './utils/authToken';
-import { apiFetch } from './apiConfig';
+import { apiFetch, apiJson } from './apiConfig';
 import ChatBox from './components/ChatBox';
 import OverflowIconBar from './components/OverflowIconBar';
+import HeaderToggle from './components/HeaderToggle';
 import CharacterCanvas from './components/CharacterCanvas';
 import DraggableWindow from './components/DraggableWindow';
 import SettingsPanel from './components/SettingsPanel';
+import CompanionWindow from './components/CompanionWindow';
+import StocksWindow from './components/StocksWindow';
 import WeatherPanel from './components/WeatherPanel';
 import AnkiWindow from './components/AnkiWindow';
 import ConversationList from './components/ConversationList';
@@ -14,8 +17,10 @@ import LoginGate from './components/LoginGate';
 import useVoice from './hooks/useVoice';
 import useLipSync from './hooks/useLipSync';
 import useReminderStream from './hooks/useReminderStream';
+import useStockAlerts from './hooks/useStockAlerts';
 import useLiveCamera from './hooks/useLiveCamera';
-import { extractTag, cleanTextForVoice, getSafeDisplayPrefix } from './utils/textParsing';
+import { extractTag, cleanTextForVoice, getVoiceSentences } from './utils/textParsing';
+import { normalizeCharacterSettings, applyCharacterUpdate } from './utils/characters';
 import './App.css';
 
 // If no chat activity (a real user send, or an assistant reply in
@@ -29,24 +34,36 @@ const TOAST_DURATION_MS = 8000;
 function App() {
     const characterRef = useRef(null);
     const chatBoxRef = useRef(null);
-    const { playVoice, resetPlaybackSchedule, enqueueSentence, waitForPlaybackToFinish } = useVoice();
+    const { playVoice, resetPlaybackSchedule, enqueueSentence, waitForPlaybackToFinish, stopVoice, prepareVoice, isPlaying } = useVoice();
     const { startLipSync, stopLipSync } = useLipSync(characterRef);
     const liveCamera = useLiveCamera();
     const [settings, setSettings] = useState(null);
     const [showSettings, setShowSettings] = useState(false);
+    const [showCompanion, setShowCompanion] = useState(false);
+    const [showStocks, setShowStocks] = useState(false);
+    const [stockUpdate, setStockUpdate] = useState(0);
     const [activeConversationId, setActiveConversationId] = useState(null);
     const [activeConversationTitle, setActiveConversationTitle] = useState(null);
     const [backgroundColor, setBackgroundColor] = useState('#1a1a1a');
     const [weatherPanel, setWeatherPanel] = useState(null);
     const [ankiWindowOpen, setAnkiWindowOpen] = useState(false);
+    const [cameraStarting, setCameraStarting] = useState(false);
     const [toast, setToast] = useState(null);
     const initConversationRef = useRef(false);
-    const cameraInitRef = useRef(false);
     const lastActivityRef = useRef(Date.now());
 
     const tagsHandledRef = useRef(false);
     const spokenPointerRef = useRef(0);
     const replyInProgressRef = useRef(false);
+    const voiceReplyRef = useRef(0);
+
+    useEffect(() => {
+        stopVoice();
+        stopLipSync();
+        voiceReplyRef.current++;
+        spokenPointerRef.current = 0;
+        replyInProgressRef.current = false;
+    }, [activeConversationId, stopVoice, stopLipSync]);
 
     const [screenSessionActive, setScreenSessionActive] = useState(false);
     const screenStreamRef = useRef(null);
@@ -55,29 +72,40 @@ function App() {
     useEffect(() => {
         apiFetch('/api/settings', { headers: authHeaders() })
             .then(r => r.json())
-            .then((data) => {
-                setSettings(data);
-                if (data.backgroundColor) setBackgroundColor(data.backgroundColor);
-
-                // Camera gatekeeper "remembers" being on across restarts —
-                // start it automatically here if it was left enabled, but
-                // only once (cameraInitRef), and only from this initial
-                // settings load, not on every settings refresh afterward.
-                if (data.cameraGatekeeper?.enabled && !cameraInitRef.current) {
-                    cameraInitRef.current = true;
-                    liveCamera.start();
+            .then(async (data) => {
+                // Camera access is session-only. Clear a saved "on" flag from
+                // older versions before the user can start it explicitly.
+                if (data.cameraGatekeeper?.enabled) {
+                    try {
+                        const response = await apiFetch('/api/settings', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                            body: JSON.stringify({ cameraGatekeeper: { enabled: false } }),
+                        });
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        data = await response.json();
+                    } catch (error) {
+                        console.error('Could not reset camera setting:', error);
+                        data = { ...data, cameraGatekeeper: { ...data.cameraGatekeeper, enabled: false } };
+                    }
                 }
+                setSettings(normalizeCharacterSettings(data));
+                if (data.backgroundColor) setBackgroundColor(data.backgroundColor);
             });
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    const selectedCharacterId = settings?.currentCharacter;
+    const settingsLoaded = Boolean(settings);
     useEffect(() => {
-        if (activeConversationId || initConversationRef.current) return;
+        if (!settingsLoaded || activeConversationId || initConversationRef.current) return;
         initConversationRef.current = true;
 
-        apiFetch('/api/conversations', { headers: authHeaders() })
+        const controller = new AbortController();
+
+        apiFetch('/api/conversations', { headers: authHeaders(), signal: controller.signal })
             .then(r => r.json())
             .then(({ conversations }) => {
+                if (controller.signal.aborted) return;
                 const reusable = conversations?.find(c => c.title === 'New conversation');
                 if (reusable) {
                     setActiveConversationId(reusable.id);
@@ -86,12 +114,15 @@ function App() {
 
                 return apiFetch('/api/conversations', {
                     method: 'POST',
-                    headers: authHeaders(),
+                    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ characterId: selectedCharacterId || null }),
+                    signal: controller.signal,
                 })
                     .then(r => r.json())
-                    .then(c => setActiveConversationId(c.id));
-            });
-    }, [activeConversationId]);
+                    .then(c => { if (!controller.signal.aborted) setActiveConversationId(c.id); });
+            }).catch(error => { if (!controller.signal.aborted) console.error('Could not open conversation:', error); });
+        return () => { controller.abort(); initConversationRef.current = false; };
+    }, [activeConversationId, settingsLoaded, selectedCharacterId]);
 
     useEffect(() => {
         return () => stopScreenSession();
@@ -116,7 +147,24 @@ function App() {
     // interrupting for, so an escalation always triggers the chat nudge
     // immediately, regardless of idle state — idle-gating it would defeat
     // the point of the feature.
+    const stockAlerts = useStockAlerts({ characterId: settings?.currentCharacter,
+        onNotify: message => setToast({ message: `📈 ${message}` }),
+        isBusy: () => Boolean(chatBoxRef.current?.isBusy?.() || replyInProgressRef.current || isPlaying() || Date.now() - lastActivityRef.current < 15000),
+        onSpeak: async text => {
+            const replyId = ++voiceReplyRef.current;
+            const clean = cleanTextForVoice(text);
+            try {
+                if (settings?.ttsBackend === 'pocket-tts' && settings?.pocketTts?.streaming) {
+                    resetPlaybackSchedule({ onAnalyser: startLipSync });
+                    getVoiceSentences(clean, { done: true }).sentences.forEach(enqueueSentence);
+                    await waitForPlaybackToFinish();
+                } else await playVoice(clean, { voice: settings?.voice || 'af_bella', onAnalyser: startLipSync });
+            }
+            finally { if (replyId === voiceReplyRef.current) stopLipSync(); }
+        },
+    });
     useReminderStream((event) => {
+        if (event.type?.startsWith('stock_alert')) { stockAlerts.receive(event);setStockUpdate(value => value + 1);return; }
         if (event.type === 'due_cards') {
             const cardWord = event.dueCount === 1 ? 'card is' : 'cards are';
             setToast({ message: `📇 ${event.dueCount} Anki ${cardWord} due for review.` });
@@ -137,21 +185,33 @@ function App() {
                 `"${event.description}". Bring it up naturally.]`
             );
         }
-    });
+    }, { onConnected: stockAlerts.refresh });
 
-    function toggleCameraGatekeeper() {
+    async function toggleCameraGatekeeper() {
+        if (cameraStarting) return;
         const next = !liveCamera.active;
-        if (next) liveCamera.start();
+        if (next) setCameraStarting(true);
         else liveCamera.stop();
 
-        apiFetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...authHeaders() },
-            body: JSON.stringify({ cameraGatekeeper: { enabled: next } }),
-        })
-            .then(r => r.json())
-            .then(setSettings)
-            .catch(err => console.error('Failed to save camera gatekeeper setting:', err));
+        try {
+            // The server must be enabled before the first frame is sent.
+            if (next) {
+                const started = await liveCamera.start();
+                if (!started) return;
+            }
+            const response = await apiFetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify({ cameraGatekeeper: { enabled: next } }),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            setSettings(normalizeCharacterSettings(await response.json()));
+        } catch (err) {
+            if (next) liveCamera.stop();
+            console.error('Failed to save camera gatekeeper setting:', err);
+        } finally {
+            setCameraStarting(false);
+        }
     }
 
     async function startScreenSession() {
@@ -202,8 +262,20 @@ function App() {
         return new File([blob], `screen-${Date.now()}.png`, { type: 'image/png' });
     }
 
-    function handleReplyChunk(rawTextSoFar, { done }) {
+    function handleReplyChunk(rawTextSoFar, { done, interrupted = false }) {
         lastActivityRef.current = Date.now();
+
+        if (interrupted) {
+            if (replyInProgressRef.current) {
+                const replyId = voiceReplyRef.current;
+                const finish = () => { if (replyId === voiceReplyRef.current) stopLipSync(); };
+                waitForPlaybackToFinish().then(finish, finish);
+            }
+            spokenPointerRef.current = 0;
+            replyInProgressRef.current = false;
+            tagsHandledRef.current = false;
+            return;
+        }
 
         const character = characterRef.current;
         const streamingVoiceEnabled = settings?.ttsBackend === 'pocket-tts' && settings?.pocketTts?.streaming;
@@ -229,39 +301,40 @@ function App() {
         if (streamingVoiceEnabled) {
             if (!replyInProgressRef.current) {
                 replyInProgressRef.current = true;
-                resetPlaybackSchedule({ onAnalyser: (analyser) => startLipSync(analyser) });
+                voiceReplyRef.current++;
+                resetPlaybackSchedule({
+                    onAnalyser: (analyser) => startLipSync(analyser),
+                    onError: error => setToast({ message: `Voice playback failed: ${error.message}` }),
+                });
             }
 
-            const safePrefix = getSafeDisplayPrefix(rawTextSoFar);
-            const voiceText = cleanTextForVoice(safePrefix);
-            const newPortion = voiceText.slice(spokenPointerRef.current);
-
-            const sentenceRegex = /[^.!?]+[.!?]+(\s+|$)/g;
-            let match;
-            let consumedInNew = 0;
-            while ((match = sentenceRegex.exec(newPortion)) !== null) {
-                const sentence = match[0].trim();
-                if (sentence) enqueueSentence(sentence);
-                consumedInNew = match.index + match[0].length;
-            }
-            spokenPointerRef.current += consumedInNew;
+            const { sentences, nextOffset } = getVoiceSentences(rawTextSoFar, {
+                start: spokenPointerRef.current, done,
+            });
+            sentences.forEach(enqueueSentence);
+            spokenPointerRef.current = nextOffset;
 
             if (done) {
-                const remainder = cleanTextForVoice(rawTextSoFar).slice(spokenPointerRef.current);
-                if (remainder.trim()) enqueueSentence(remainder.trim());
-
-                waitForPlaybackToFinish().then(stopLipSync).catch(() => stopLipSync());
+                const replyId = voiceReplyRef.current;
+                const finishLipSync = () => {
+                    if (replyId === voiceReplyRef.current) stopLipSync();
+                };
+                waitForPlaybackToFinish().then(finishLipSync, finishLipSync);
 
                 spokenPointerRef.current = 0;
                 replyInProgressRef.current = false;
             }
         } else if (done) {
+            const replyId = ++voiceReplyRef.current;
             const cleanText = cleanTextForVoice(rawTextSoFar);
             playVoice(cleanText, {
                 voice: settings?.voice || 'af_bella',
                 onAnalyser: (analyser) => startLipSync(analyser),
-            }).then(stopLipSync).catch((err) => {
-                console.error('Voice playback failed:', err);
+            }).then(() => {
+                if (replyId === voiceReplyRef.current) stopLipSync();
+            }).catch((err) => {
+                if (replyId !== voiceReplyRef.current || err.name === 'AbortError') return;
+                setToast({ message: `Voice playback failed: ${err.message}` });
                 stopLipSync();
             });
         }
@@ -278,6 +351,10 @@ function App() {
             } else if (event.window === 'anki') {
                 if (event.action === 'show') setAnkiWindowOpen(true);
                 else if (event.action === 'hide') setAnkiWindowOpen(false);
+            } else if (event.window === 'outfits' && event.action === 'change') {
+                apiJson(`/api/characters/${encodeURIComponent(event.characterId)}/outfits`)
+                    .then(({ character }) => handleCharacterChange(character))
+                    .catch(error => setToast({ message: `Could not refresh outfit: ${error.message}` }));
             }
         }
     }
@@ -288,7 +365,16 @@ function App() {
 
     function handleSettingsChange(updated) {
         if (updated.backgroundColor) setBackgroundColor(updated.backgroundColor);
-        setSettings(updated);
+        if (settings?.currentCharacter !== updated.currentCharacter) {
+            initConversationRef.current = false;
+            setActiveConversationId(null);
+            setActiveConversationTitle(null);
+        }
+        setSettings(normalizeCharacterSettings(updated));
+    }
+
+    function handleCharacterChange(character) {
+        setSettings(current => applyCharacterUpdate(current, character));
     }
 
     function handleSelectConversation(id) {
@@ -311,7 +397,7 @@ function App() {
             <div className="app-root" style={{ '--bg-color': backgroundColor }}>
                 <CharacterCanvas
                     ref={characterRef}
-                    characterFile={settings?.currentCharacter}
+                    character={settings?.character}
                     lighting={settings?.lighting}
                 />
 
@@ -325,6 +411,7 @@ function App() {
                             <ConversationList
                                 activeId={activeConversationId}
                                 activeTitle={activeConversationTitle}
+                                characterId={settings?.currentCharacter}
                                 onSelect={handleSelectConversation}
                                 onNew={(id) => {
                                     setActiveConversationId(id);
@@ -336,47 +423,50 @@ function App() {
                                 items={[
                                     {
                                         id: 'screen',
-                                        title: screenSessionActive ? 'Stop screen sharing' : 'Start screen sharing session',
-                                        content: (
-                                            <button
-                                                type="button"
-                                                onClick={screenSessionActive ? stopScreenSession : startScreenSession}
-                                                title={screenSessionActive ? 'Stop screen sharing' : 'Start screen sharing session'}
-                                                className={`tools-menu-toggle${screenSessionActive ? ' screen-session-active' : ''}`}
-                                            >
-                                                🖥️
-                                            </button>
-                                        ),
+                                        title: 'Screen',
+                                        content: <HeaderToggle icon="🖥️" label="Screen" active={screenSessionActive}
+                                            onClick={screenSessionActive ? stopScreenSession : startScreenSession} />,
+                                        menuContent: <HeaderToggle icon="🖥️" label="Screen" active={screenSessionActive} inMenu
+                                            onClick={screenSessionActive ? stopScreenSession : startScreenSession} />,
                                     },
                                     {
                                         id: 'camera',
-                                        title: liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring',
-                                        content: (
-                                            <button
-                                                type="button"
-                                                onClick={toggleCameraGatekeeper}
-                                                title={liveCamera.active ? 'Stop live camera monitoring' : 'Start live camera monitoring'}
-                                                className={`tools-menu-toggle${liveCamera.active ? ' screen-session-active' : ''}`}
-                                            >
-                                                📷
-                                            </button>
-                                        ),
+                                        title: 'Camera',
+                                        content: <HeaderToggle icon="📷" label="Camera" active={liveCamera.active}
+                                            disabled={!settings || cameraStarting} onClick={toggleCameraGatekeeper} />,
+                                        menuContent: <HeaderToggle icon="📷" label="Camera" active={liveCamera.active} inMenu
+                                            disabled={!settings || cameraStarting} onClick={toggleCameraGatekeeper} />,
                                     },
                                     {
                                         id: 'anki',
-                                        title: ankiWindowOpen ? 'Close review' : 'Review flashcards',
-                                        content: (
-                                            <button
-                                                type="button"
-                                                onClick={() => setAnkiWindowOpen(o => !o)}
-                                                title={ankiWindowOpen ? 'Close review' : 'Review flashcards'}
-                                                className={`tools-menu-toggle${ankiWindowOpen ? ' screen-session-active' : ''}`}
-                                            >
-                                                📇
-                                            </button>
-                                        ),
+                                        title: 'Review',
+                                        content: <HeaderToggle icon="📇" label="Review" active={ankiWindowOpen}
+                                            onClick={() => setAnkiWindowOpen(o => !o)} />,
+                                        menuContent: <HeaderToggle icon="📇" label="Review" active={ankiWindowOpen} inMenu
+                                            onClick={() => setAnkiWindowOpen(o => !o)} />,
                                     },
-                                    { id: 'tools', title: 'Tools available to the AI', content: <ToolsMenu />, menuContent: <ToolsMenu embedded /> },
+                                    { id: 'tools', title: 'Tools', content: <ToolsMenu />, menuContent: <ToolsMenu embedded /> },
+                                    {
+                                        id: 'companion', title: 'Companion', closeOnSelect: true,
+                                        content: <HeaderToggle icon="👕" label="Companion" active={showCompanion}
+                                            onClick={() => setShowCompanion(open => !open)} />,
+                                        menuContent: <HeaderToggle icon="👕" label="Companion" active={showCompanion} inMenu
+                                            onClick={() => setShowCompanion(open => !open)} />,
+                                    },
+                                    {
+                                        id: 'stocks', title: 'Stocks', closeOnSelect: true,
+                                        content: <HeaderToggle icon="📈" label="Stocks" active={showStocks}
+                                            onClick={() => setShowStocks(open => !open)} />,
+                                        menuContent: <HeaderToggle icon="📈" label="Stocks" active={showStocks} inMenu
+                                            onClick={() => setShowStocks(open => !open)} />,
+                                    },
+                                    {
+                                        id: 'settings', title: 'Settings', closeOnSelect: true,
+                                        content: <HeaderToggle icon="⚙" label="Settings" active={showSettings}
+                                            onClick={() => setShowSettings(open => !open)} />,
+                                        menuContent: <HeaderToggle icon="⚙" label="Settings" active={showSettings} inMenu
+                                            onClick={() => setShowSettings(open => !open)} />,
+                                    },
                                 ]}
                             />
                         </div>
@@ -390,7 +480,11 @@ function App() {
                         onReplyChunk={handleReplyChunk}
                         onUiEvents={handleUiEvents}
                         onConversationUpdated={handleConversationUpdated}
-                        onUserActivity={() => { lastActivityRef.current = Date.now(); }}
+                        onUserActivity={() => {
+                            lastActivityRef.current = Date.now();
+                            // Resume in the user gesture, before waiting for the LLM.
+                            prepareVoice().catch(error => setToast({ message: `Voice playback failed: ${error.message}` }));
+                        }}
                         screenSessionActive={screenSessionActive}
                         onGrabScreenFrame={grabScreenFrame}
                     />
@@ -434,18 +528,22 @@ function App() {
                     </DraggableWindow>
                 )}
 
-                <button
-                    onClick={() => setShowSettings(s => !s)}
-                    className="settings-toggle-btn"
-                >
-                    ⚙ Settings
-                </button>
-
                 {showSettings && (
-                    <DraggableWindow title="Settings" initialX={window.innerWidth - 380} initialY={60} width={340}>
-                        <SettingsPanel onSettingsChange={handleSettingsChange} />
+                    <DraggableWindow title="Settings" initialX={window.innerWidth - 380} initialY={60} width={340}
+                        onClose={() => setShowSettings(false)}>
+                        <SettingsPanel key={settings?.currentCharacter} onSettingsChange={handleSettingsChange} onOpenCompanion={() => setShowCompanion(true)} />
                     </DraggableWindow>
                 )}
+
+                {showCompanion && <CompanionWindow character={settings?.character}
+                    onSettingsChange={handleSettingsChange} onCharacterChange={handleCharacterChange} onClose={() => setShowCompanion(false)} />}
+
+                {showStocks && <StocksWindow updateSignal={stockUpdate} onClose={() => setShowStocks(false)}
+                    onPrepareVoice={() => prepareVoice().catch(error => setToast({ message: `Voice playback failed: ${error.message}` }))}
+                    onAlertsRead={stockAlerts.refresh} onConfigChange={config => {
+                        setSettings(current => current ? { ...current, stockMonitor: config } : current);
+                        stockAlerts.refresh();
+                    }} />}
 
                 {toast && (
                     <div className="reminder-toast" role="status">

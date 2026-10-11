@@ -11,6 +11,10 @@ function registerAlias(db, category, key, factId) {
     db.prepare(`INSERT INTO fact_aliases (category, key, fact_id) VALUES (?, ?, ?)
         ON CONFLICT(category, key) DO UPDATE SET fact_id = excluded.fact_id`)
         .run(category, key, factId);
+    if (db.prepare('PRAGMA user_version').get().user_version >= 5) {
+        db.prepare('UPDATE fact_aliases SET topic_identity = ? WHERE category = ? AND key = ?')
+            .run(topicIdentity(key), category, key);
+    }
 }
 
 function mergeFactRows(db, rows) {
@@ -28,6 +32,18 @@ function mergeFactRows(db, rows) {
         db.prepare('UPDATE fact_revisions SET fact_id = ? WHERE fact_id = ?').run(winner.id, row.id);
         db.prepare('UPDATE fact_merge_archive SET fact_id = ? WHERE fact_id = ?').run(winner.id, row.id);
         db.prepare('UPDATE fact_aliases SET fact_id = ? WHERE fact_id = ?').run(winner.id, row.id);
+        if (db.prepare('PRAGMA user_version').get().user_version >= 5) {
+            for (const proposal of db.prepare('SELECT * FROM fact_proposals WHERE fact_id = ?').all(row.id)) {
+                db.prepare('INSERT INTO fact_merge_archive (fact_id, original_fact, merged_at) VALUES (?, ?, ?)')
+                    .run(winner.id, JSON.stringify({ kind: 'proposal', ...proposal }), now);
+                db.prepare(`INSERT OR IGNORE INTO fact_proposals
+                    (fact_id,value,normalized_value,source_conversation_id,source_message_index,source_quote,created_at,status)
+                    VALUES (?,?,?,?,?,?,?,?)`).run(winner.id, proposal.value, proposal.normalized_value,
+                        proposal.source_conversation_id, proposal.source_message_index, proposal.source_quote,
+                        proposal.created_at, proposal.status);
+            }
+            db.prepare('DELETE FROM fact_proposals WHERE fact_id = ?').run(row.id);
+        }
         db.prepare('DELETE FROM facts WHERE id = ?').run(row.id);
     }
     db.prepare('UPDATE facts SET pinned = ?, updated_at = ? WHERE id = ?')

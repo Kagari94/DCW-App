@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const defaults = require('./config.js');
+const characterStore = require('./lib/characters.js');
 
 const SETTINGS_PATH = path.join(__dirname, 'data', 'settings.json');
 
@@ -76,6 +77,7 @@ function baseSeed() {
             caCertPath: '',
         },
 
+        stockMonitor: require('./lib/stocks/config').DEFAULTS,
         currentCharacter: null,
         backgroundColor: '#1a1a1a',
         voice: 'af_bella',
@@ -109,56 +111,92 @@ function baseSeed() {
     };
 }
 
-function ensureSettingsFile() {
-    const dir = path.dirname(SETTINGS_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(SETTINGS_PATH)) {
-        fs.writeFileSync(SETTINGS_PATH, JSON.stringify(baseSeed(), null, 2));
-    }
-}
-
-function getSettings() {
-    ensureSettingsFile();
-    const overrides = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'));
-    const seed = baseSeed();
-    return { ...defaults, ...seed, ...overrides };
-}
-
-function updateSettings(partial) {
-    ensureSettingsFile();
-    const current = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'));
-    let merged = { ...current, ...partial };
-
-    // llm needs a deeper merge than the shallow spread above — otherwise
-    // saving one provider's field (or switching the active provider) would
-    // silently wipe out every other provider's remembered settings, since
-    // `partial.llm.providers` only ever contains the one provider actually
-    // being edited.
-    if (partial.llm) {
-        merged.llm = { ...(current.llm || {}), ...partial.llm };
-        if (partial.llm.providers) {
-            const mergedProviders = { ...(current.llm?.providers || {}) };
-            for (const key of Object.keys(partial.llm.providers)) {
-                mergedProviders[key] = {
-                    ...(current.llm?.providers?.[key] || {}),
-                    ...partial.llm.providers[key],
-                };
-            }
-            merged.llm.providers = mergedProviders;
+function createSettingsStore({ settingsPath = SETTINGS_PATH, characters = characterStore } = {}) {
+    const { readCharacter, updateCharacter, voiceFromSettings, profileVoiceSettings } = characters;
+    function ensureSettingsFile() {
+        const dir = path.dirname(settingsPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        if (!fs.existsSync(settingsPath)) {
+            fs.writeFileSync(settingsPath, JSON.stringify(baseSeed(), null, 2));
         }
-        merged = { ...merged, ...deriveModelConfig(merged.llm) };
     }
 
-    // Same reasoning as `llm` above — cameraGatekeeper is a nested object,
-    // and the header icon toggle sends only { enabled } while the Settings
-    // panel's fields send other keys separately; a shallow top-level
-    // spread would let either one silently wipe out the other's fields.
-    if (partial.cameraGatekeeper) {
-        merged.cameraGatekeeper = { ...(current.cameraGatekeeper || {}), ...partial.cameraGatekeeper };
+    function getSettings() {
+        ensureSettingsFile();
+        const overrides = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        const seed = baseSeed();
+        const settings = { ...defaults, ...seed, ...overrides };
+        settings.stockMonitor = require('./lib/stocks/config').validateMonitor(overrides.stockMonitor);
+        let character = null;
+        try { character = readCharacter(settings.currentCharacter); }
+        catch (error) { console.warn(`Selected character unavailable: ${error.message}`); }
+        return { ...profileVoiceSettings(settings, character), character };
     }
 
-    fs.writeFileSync(SETTINGS_PATH, JSON.stringify(merged, null, 2));
-    return { ...defaults, ...merged };
+    function updateSettings(partial) {
+        ensureSettingsFile();
+        const current = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        let merged = { ...current, ...partial };
+        if (Object.prototype.hasOwnProperty.call(partial, 'stockMonitor')) {
+            merged.stockMonitor = require('./lib/stocks/config').validateMonitor(current.stockMonitor, partial.stockMonitor);
+        }
+
+        // llm needs a deeper merge than the shallow spread above — otherwise
+        // saving one provider's field (or switching the active provider) would
+        // silently wipe out every other provider's remembered settings, since
+        // `partial.llm.providers` only ever contains the one provider actually
+        // being edited.
+        if (partial.llm) {
+            merged.llm = { ...(current.llm || {}), ...partial.llm };
+            if (partial.llm.providers) {
+                const mergedProviders = { ...(current.llm?.providers || {}) };
+                for (const key of Object.keys(partial.llm.providers)) {
+                    mergedProviders[key] = {
+                        ...(current.llm?.providers?.[key] || {}),
+                        ...partial.llm.providers[key],
+                    };
+                }
+                merged.llm.providers = mergedProviders;
+            }
+            merged = { ...merged, ...deriveModelConfig(merged.llm) };
+        }
+
+        // Same reasoning as `llm` above — cameraGatekeeper is a nested object,
+        // and the header icon toggle sends only { enabled } while the Settings
+        // panel's fields send other keys separately; a shallow top-level
+        // spread would let either one silently wipe out the other's fields.
+        if (partial.cameraGatekeeper) {
+            merged.cameraGatekeeper = { ...(current.cameraGatekeeper || {}), ...partial.cameraGatekeeper };
+        }
+        if (partial.pocketTts) {
+            merged.pocketTts = { ...(current.pocketTts || {}), ...partial.pocketTts };
+        }
+
+        // A profile owns its voice. Keep the legacy global voice as the fallback
+        // for loose VRMs, while other Pocket settings remain shared.
+        const selected = merged.currentCharacter;
+        const character = selected && readCharacter(selected);
+        if (character && !character.legacy) {
+            const has = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
+            if (has(partial, 'ttsBackend') || has(partial, 'voice') || has(partial.pocketTts, 'voice')) {
+                updateCharacter(character.id, { voice: {
+                    backend: has(partial, 'ttsBackend') ? partial.ttsBackend : character.voice.backend,
+                    kokoro: has(partial, 'voice') ? partial.voice : character.voice.kokoro,
+                    pocket: has(partial.pocketTts, 'voice')
+                        ? voiceFromSettings({ pocketTts: { voice: partial.pocketTts.voice } }).pocket
+                        : character.voice.pocket,
+                } });
+            }
+            merged.ttsBackend = current.ttsBackend;
+            merged.voice = current.voice;
+            merged.pocketTts = { ...merged.pocketTts, voice: current.pocketTts?.voice || '' };
+        }
+
+        fs.writeFileSync(settingsPath, JSON.stringify(merged, null, 2));
+        return getSettings();
+    }
+
+    return { getSettings, updateSettings };
 }
 
-module.exports = { getSettings, updateSettings };
+module.exports = { ...createSettingsStore(), createSettingsStore };

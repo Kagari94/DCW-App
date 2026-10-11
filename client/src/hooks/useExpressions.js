@@ -71,10 +71,19 @@ export default function useExpressions({ vrmRef, eyeClosingExpressionsRef }) {
     }
 
     function startBlinking() {
+        let active = true;
+        const timers = new Set();
+        function schedule(callback, delay) {
+            const timer = setTimeout(() => {
+                timers.delete(timer);
+                if (active) callback();
+            }, delay);
+            timers.add(timer);
+        }
         function blink() {
             const vrm = vrmRef.current;
             if (!vrm?.expressionManager) {
-                setTimeout(blink, 1000);
+                schedule(blink, 1000);
                 return;
             }
 
@@ -85,20 +94,25 @@ export default function useExpressions({ vrmRef, eyeClosingExpressionsRef }) {
 
             if (!eyesAlreadyClosed) {
                 setExpression('blink', 1.0, 0.06);
-                setTimeout(() => setExpression('blink', 0.0, 0.1), 120);
+                schedule(() => setExpression('blink', 0.0, 0.1), 120);
 
                 if (Math.random() < 0.15) {
-                    setTimeout(() => {
+                    schedule(() => {
                         setExpression('blink', 1.0, 0.06);
-                        setTimeout(() => setExpression('blink', 0.0, 0.1), 120);
+                        schedule(() => setExpression('blink', 0.0, 0.1), 120);
                     }, 300);
                 }
             }
 
             const nextBlink = 2000 + Math.random() * 4000;
-            setTimeout(blink, nextBlink);
+            schedule(blink, nextBlink);
         }
         blink();
+        return () => {
+            active = false;
+            for (const timer of timers) clearTimeout(timer);
+            timers.clear();
+        };
     }
 
     return { setExpression, resetExpressions, getEyeClosingExpressionNames, startBlinking };

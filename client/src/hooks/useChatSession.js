@@ -172,7 +172,10 @@ export default function useChatSession({ conversationId, onReplyChunk, onUiEvent
             if (onConversationUpdated) onConversationUpdated(finalPayload.title);
 
         } catch (err) {
-            if (!signal.aborted) updateLastAiMessage(`Error: ${err.message}`);
+            if (!signal.aborted) {
+                updateLastAiMessage(`Error: ${err.message}`);
+                onReplyChunk?.(rawBuffer, { done: true, interrupted: true });
+            }
         } finally {
             inFlightRef.current = false;
             if (!signal.aborted) setLoading(false);

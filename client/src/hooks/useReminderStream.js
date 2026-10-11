@@ -16,8 +16,9 @@ import { readNdjson } from '../utils/ndjson';
 // channel, not worth anything fancier like exponential backoff.
 const RECONNECT_DELAY_MS = 5000;
 
-export default function useReminderStream(onEvent) {
+export default function useReminderStream(onEvent, { onConnected } = {}) {
     const handleEvent = useLatestCallback(onEvent);
+    const connected = useLatestCallback(onConnected);
 
     useEffect(() => {
         let cancelled = false;
@@ -32,6 +33,7 @@ export default function useReminderStream(onEvent) {
                         signal: abortController.signal,
                     });
                     if (!res.ok || !res.body) throw new Error(`Events stream failed (${res.status})`);
+                    connected();
 
                     for await (const event of readNdjson(res)) {
                         if (cancelled) break;
@@ -54,5 +56,5 @@ export default function useReminderStream(onEvent) {
             cancelled = true;
             abortController?.abort();
         };
-    }, [handleEvent]);
+    }, [handleEvent, connected]);
 }

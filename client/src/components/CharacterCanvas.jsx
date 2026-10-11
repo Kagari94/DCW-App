@@ -7,7 +7,7 @@ import useVrmModel from '../hooks/useVrmModel';
 // Orchestrator only — owns the shared refs and wires the split-out hooks
 // together. Scene/render-loop, expressions, animation playback, and model
 // loading each live in their own file now (see hooks/ and utils/).
-const CharacterCanvas = forwardRef(({ characterFile, lighting }, ref) => {
+const CharacterCanvas = forwardRef(({ character, lighting }, ref) => {
     const vrmRef = useRef(null);
     const mixerRef = useRef(null);
     const loadedAnimationsRef = useRef({});
@@ -25,7 +25,7 @@ const CharacterCanvas = forwardRef(({ characterFile, lighting }, ref) => {
         useAnimationPlayback({ mixerRef, loadedAnimationsRef, currentActionRef, idleActionRef, animationsReadyRef });
 
     useVrmModel({
-        characterFile,
+        character,
         sceneRef,
         vrmRef,
         mixerRef,

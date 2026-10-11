@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import useHeaderIconOverflow from '../hooks/useHeaderIconOverflow';
 
-// Renders `items` (each { id, title, content, menuContent? }) inline, in a
+// Renders `items` (each { id, title, content, menuContent?, closeOnSelect? }) inline, in a
 // user-draggable order, collapsing whatever doesn't currently fit into a
 // dropdown behind a chevron — reuses ToolsMenu's own dropdown look
 // (.tools-menu-dropdown) so it doesn't introduce a third visual style.
@@ -64,7 +64,11 @@ function OverflowIconBar({ items, storageKey }) {
                     {open && (
                         <div className="tools-menu-dropdown overflow-bar-dropdown" onWheel={stopDrag}>
                             {overflowIds.map(id => (
-                                <div key={id} className="overflow-bar-dropdown-item" {...dragHandlers(id)}>
+                                <div key={id} className="overflow-bar-dropdown-item" {...dragHandlers(id)}
+                                    onClick={() => {
+                                        // The child button runs first; closing on capture would swallow its click.
+                                        if (byId[id]?.closeOnSelect) setOpen(false);
+                                    }}>
                                     <span className="overflow-bar-dropdown-icon">
                                         {byId[id]?.menuContent ?? byId[id]?.content}
                                     </span>
@@ -81,7 +85,7 @@ function OverflowIconBar({ items, storageKey }) {
                 Always uses `content` (the inline form) since fit is about
                 how wide the item would be if shown in the bar, regardless
                 of where it actually ends up rendering. */}
-            <div className="overflow-bar-measure" aria-hidden="true">
+            <div className="overflow-bar-measure" aria-hidden="true" inert={true}>
                 {items.map(i => (
                     <span key={i.id} ref={(el) => { itemRefs.current[i.id] = el; }}>{i.content}</span>
                 ))}

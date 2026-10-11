@@ -1,20 +1,26 @@
 import { useState, useEffect } from 'react';
 import { apiJson } from '../apiConfig';
 
-function ConversationList({ activeId, activeTitle, onSelect, onNew }) {
+function ConversationList({ activeId, activeTitle, onSelect, onNew, characterId }) {
     const [conversations, setConversations] = useState([]);
 
     useEffect(() => {
-        loadList().catch(error => alert(error.message));
-    }, [activeId]);
+        const controller = new AbortController();
+        loadList(controller.signal).catch(error => {
+            if (!controller.signal.aborted) alert(error.message);
+        });
+        return () => controller.abort();
+    }, [activeId, characterId]);
 
-    async function loadList() {
-        const data = await apiJson('/api/conversations');
-        setConversations(data.conversations || []);
+    async function loadList(signal) {
+        const data = await apiJson('/api/conversations', { signal });
+        if (!signal?.aborted) setConversations(data.conversations || []);
     }
 
     async function handleNew() {
-        const conversation = await apiJson('/api/conversations', { method: 'POST' });
+        const conversation = await apiJson('/api/conversations', {
+            method: 'POST', body: JSON.stringify({ characterId: characterId || null }),
+        });
         await loadList();
         onNew(conversation.id);
     }
@@ -44,6 +50,7 @@ function ConversationList({ activeId, activeTitle, onSelect, onNew }) {
                 value={activeId || ''}
                 onChange={(e) => onSelect(e.target.value)}
             >
+                <option value="" disabled>Select conversation</option>
                 {conversations.map(c => (
                     <option key={c.id} value={c.id}>{c.id === activeId && activeTitle ? activeTitle : c.title}</option>
                 ))}

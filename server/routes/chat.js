@@ -6,6 +6,13 @@ const { validateConversationId } = require('../conversations');
 const { withConversationLock } = require('../lib/conversationLock');
 const { pendingToolCalls } = require('../lib/toolLoop');
 const { readSystemPrompt } = require('../lib/systemPrompt');
+const { beginForeground } = require('../lib/memory/foreground');
+const { assertValidModelOutput } = require('../lib/modelOutput');
+
+function conversationMatchesCharacter(conversation, selected) {
+    if (conversation.characterId) return conversation.characterId === selected;
+    return !selected || selected.toLowerCase().endsWith('.vrm');
+}
 
 function makeRouter({
     store = require('../conversations'),
@@ -21,7 +28,11 @@ function makeRouter({
     function serialized(handler) {
         return async (req, res) => {
             const id = validateConversationId(req.params.id ?? req.body?.conversationId);
-            await withConversationLock(id, () => handler(req, res));
+            await withConversationLock(id, async () => {
+                const release = beginForeground();
+                try { return await handler(req, res); }
+                finally { release(); }
+            });
         };
     }
 
@@ -32,21 +43,33 @@ function makeRouter({
     let lastActiveConversationId = null;
 
     router.get('/conversations', (req, res) => {
-        res.json({ conversations: listConversations() });
+        const selected = getSettings().currentCharacter || null;
+        res.json({ conversations: listConversations().filter(item => conversationMatchesCharacter(item, selected)) });
     });
 
     router.post('/conversations', (req, res) => {
-        const conversation = createConversation(systemPrompt);
+        const selected = getSettings().currentCharacter || null;
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, 'characterId') && req.body.characterId !== selected) {
+            return res.status(409).json({ error: 'Selected companion changed. Try again.' });
+        }
+        const conversation = createConversation(systemPrompt, selected);
         res.json(conversation);
     });
 
     router.get('/conversations/:id', (req, res) => {
         const conversation = loadConversation(req.params.id);
         if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
+        if (!conversationMatchesCharacter(conversation, getSettings().currentCharacter || null)) {
+            return res.status(409).json({ error: 'This conversation belongs to another companion.' });
+        }
         res.json(conversation);
     });
 
     router.delete('/conversations/:id', serialized((req, res) => {
+        const conversation = loadConversation(req.params.id);
+        if (conversation && !conversationMatchesCharacter(conversation, getSettings().currentCharacter || null)) {
+            return res.status(409).json({ error: 'This conversation belongs to another companion.' });
+        }
         deleteConversation(req.params.id);
         memory.deleteConversationMemory?.(req.params.id);
         res.json({ deleted: true });
@@ -67,7 +90,7 @@ function makeRouter({
             // no background memory jobs — those only make sense once there's
             // an actual reply.
             conversation.pendingTurn = {
-                memoryContext: toolConfig.memoryContext, userText: userTextForMemoryJobs,
+                memoryContext: toolConfig.memoryContext, memoryRevision: toolConfig.memoryRevision, userText: userTextForMemoryJobs,
                 toolCallId: needsScreenFrame.toolCallId,
                 uiEvents: [...(conversation.pendingTurn?.uiEvents || []), ...(uiEvents || [])],
                 messageStart: conversation.pendingTurn?.messageStart ?? messageCountBeforeThisTurn,
@@ -93,6 +116,7 @@ function makeRouter({
 
         const reply = finalMessage.content;
         if (!reply) throw new Error('No content in AI response.');
+        assertValidModelOutput(reply);
 
         conversation.messages.push({
             role: 'assistant',
@@ -145,6 +169,9 @@ function makeRouter({
         if (!conversation) {
             return res.status(404).json({ error: 'Conversation not found.' });
         }
+        if (!conversationMatchesCharacter(conversation, CONFIG.currentCharacter || null)) {
+            return res.status(409).json({ error: 'This conversation belongs to another companion.' });
+        }
 
         if (conversation.pendingTurn) {
             return res.status(409).json({ error: 'Finish the pending screen capture before sending another message.' });
@@ -190,13 +217,14 @@ function makeRouter({
             // heuristic in retrieval.js thinks they're relevant) and threaded
             // through toolConfig so toolCallLoop.js can inject it fresh on every
             // model call without recomputing it per tool-loop iteration.
-            const memoryContext = await buildMemoryContext(message, conversationId);
+            const memoryContext = await buildMemoryContext(message, conversationId, { characterId: conversation.characterId });
             // screenSessionActive comes from the client on every request — it's
             // per-session UI state (is getDisplayMedia currently authorized in
             // THIS browser tab), not something the server can know or persist
             // on its own. tools/handlers/screen.js reads this to decide whether
             // view_screen can actually be fulfilled.
-            const toolConfig = { ...CONFIG, conversationId, memoryContext, screenSessionActive: Boolean(screenSessionActive) };
+            const toolConfig = { ...CONFIG, characterId: conversation.characterId || CONFIG.currentCharacter,
+                conversationId, memoryContext, memoryRevision: memory.getMemoryRevision?.(), screenSessionActive: Boolean(screenSessionActive) };
 
             await runTurnAndRespond({
                 conversation,
@@ -244,6 +272,9 @@ function makeRouter({
 
         const conversation = loadConversation(conversationId);
         if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
+        if (!conversationMatchesCharacter(conversation, CONFIG.currentCharacter || null)) {
+            return res.status(409).json({ error: 'This conversation belongs to another companion.' });
+        }
 
         const pendingCall = pendingToolCalls(conversation.messages).find(call => call.id === toolCallId);
         if (!pendingCall) {
@@ -280,8 +311,11 @@ function makeRouter({
         });
 
         try {
-            const memoryContext = pendingTurn ? pendingTurn.memoryContext : await buildMemoryContext('', conversationId);
-            const toolConfig = { ...CONFIG, conversationId, memoryContext, screenSessionActive: Boolean(screenSessionActive) };
+            const memoryContext = pendingTurn && pendingTurn.memoryRevision === memory.getMemoryRevision?.()
+                ? pendingTurn.memoryContext
+                : await buildMemoryContext(pendingTurn?.userText || '', conversationId, { characterId: conversation.characterId });
+            const toolConfig = { ...CONFIG, characterId: conversation.characterId || CONFIG.currentCharacter,
+                conversationId, memoryContext, memoryRevision: memory.getMemoryRevision?.(), screenSessionActive: Boolean(screenSessionActive) };
 
             await runTurnAndRespond({
                 conversation,
